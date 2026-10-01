@@ -193,6 +193,7 @@ a large job from waiting indefinitely behind a stream of small ones.
 | Memory per job | A quarter of the smallest GPU, then 110% of the queue's largest known peak, capped at what an idle GPU grants | `--mem-mib`, `mem_mib`, `free_mem_mib` |
 | Jobs that use no GPU, at once | A quarter of the usable CPU cores | `cpu_cap` in the policy |
 | Failures in a row before a queue is paused | 5 | `jobq submit --max-consecutive-failures N` |
+| How long a failure pause lasts | 900 seconds | `failure_pause_s` in the policy |
 | Yielding to other users | Off | `yield_to_foreign` in the policy |
 | NVIDIA MPS | On where the machine allows it | `mps` in the policy |
 | Queue priority | 0; higher runs first | `jobq submit --priority N`, `jobq priority` |

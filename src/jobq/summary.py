@@ -86,6 +86,7 @@ class QueueSummary:
     mem_job_min_mib: int | None = None
     mem_job_max_mib: int | None = None
     parked_reason: str | None = None
+    pause_left_s: float | None = None
     slots: int = 1
     no_gpu: bool = False
     median_run_s: float | None = None
@@ -114,6 +115,8 @@ class QueueSummary:
             return f"waiting for {', '.join(self.waiting_for)}"
         if self.state == OTHER_MACHINE:
             return f"only on {self.runs_on}"
+        if self.state == PAUSED and self.pause_left_s is not None:
+            return f"paused, {duration_text(max(0.0, self.pause_left_s))} left"
         return self.state
 
     @property
@@ -598,6 +601,10 @@ def _summarize(
         machines=meta.runs_on_text if meta.ties else "",
         runs_here=runs_here,
         parked_reason=meta.parked_reason,
+        pause_left_s=(
+            store.pause_left_s(store.read_pause(root, name) or {})
+            if state == PAUSED else None
+        ),
         waiting_for=waiting_for,
         median_run_s=median_s,
         median_samples=samples,

@@ -56,7 +56,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass, field, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from loguru import logger
@@ -204,6 +204,35 @@ def read_json_dict(path: Path) -> tuple[str, dict]:
 
 
 # --------------------------- path helpers ---------------------------
+
+
+_FOLDER_PERMS_SEEN: set[str] = set()
+_FOLDER_PERMS_LOCK = threading.Lock()
+
+
+def apply_folder_perms(root: Path) -> bool:
+    """Follow this machine's ``shared_perms`` for ``root``; return whether it is on.
+
+    Every public writer here calls this first, so a program that imports this module
+    creates queue state the way the folder's policy asks, as the command line and the
+    pool do. The policy is read once per queue folder per process; a missing or unusable
+    policy leaves the switch as it is.
+    """
+    key = str(root)
+    if key in _FOLDER_PERMS_SEEN:
+        return io.shared_perms()
+    from jobq import gpu  # gpu imports this module
+
+    resolved = str(Path(root).resolve())
+    with _FOLDER_PERMS_LOCK:
+        if resolved not in _FOLDER_PERMS_SEEN:
+            try:
+                if gpu.load_policy(Path(root), this_host()).shared_perms:
+                    io.set_shared_perms(True)
+            except (FileNotFoundError, gpu.PolicyError):
+                pass
+        _FOLDER_PERMS_SEEN.update((key, resolved))
+    return io.shared_perms()
 
 
 def ensure_dir(path: Path) -> Path:
@@ -826,6 +855,7 @@ def create_queue(
     Errors if the queue exists unless ``exist_ok`` — in which case the existing meta is
     kept untouched (append semantics: more jobs may be submitted, meta is set once).
     """
+    apply_folder_perms(root)
     if queue_exists(root, name):
         if not exist_ok:
             raise FileExistsError(f"queue {name!r} already exists under {root}")
@@ -965,6 +995,7 @@ def submit_jobs(
         QueueSettingsConflict: the queue exists with other settings; nothing is written.
         ValueError: a job key cannot be used, or is already in the queue.
     """
+    apply_folder_perms(root)
     check_queue_name(name)
     ensure_dir(Path(root))
     with file_lock(submit_lock_path(root)):
@@ -1000,6 +1031,7 @@ def append_jobs(root: Path, name: str, jobs: list[Job]) -> list[Job]:
     duplicate check is re-run inside the lock, so an earlier unlocked check by a caller is
     only an early-rejection convenience.
     """
+    apply_folder_perms(root)
     import json
 
     ensure_dir(queue_dir(root, name))
@@ -1038,6 +1070,7 @@ def set_queue_priority(root: Path, name: str, priority: int) -> tuple[int, int]:
     Pools re-read the settings of every queue on each pass through their ready list, so
     the new priority decides the next claim rather than the queue being restarted.
     """
+    apply_folder_perms(root)
     before, after = _update_meta(
         root, name, lambda m: replace(m, priority=int(priority))
     )
@@ -1072,6 +1105,7 @@ def set_queue_ties(
 
     Returns the tie before and after, written as it is typed.
     """
+    apply_folder_perms(root)
     before, after = _update_meta(
         root, name, lambda m: replace(m, **tie_fields(ties))
     )
@@ -1087,6 +1121,7 @@ def add_queue_tie(
     moment both land: the second reads what the first wrote. A machine already in the tie
     is replaced, which is how the GPUs named for it are changed.
     """
+    apply_folder_perms(root)
     def _mutate(meta: QueueMeta) -> QueueMeta:
         kept = tuple(t for t in meta.ties if t.machine != tie.machine)
         return replace(meta, **tie_fields(kept + (tie,)))
@@ -1097,6 +1132,7 @@ def add_queue_tie(
 
 def remove_queue_tie(root: Path, name: str, machine: str) -> tuple[str, str]:
     """Remove one machine from a queue's tie, keeping the rest, under the one lock."""
+    apply_folder_perms(root)
 
     def _mutate(meta: QueueMeta) -> QueueMeta:
         kept = tuple(t for t in meta.ties if t.machine != machine)
@@ -1114,6 +1150,7 @@ def set_queue_parked(
     Unparking also removes a machine tie that spells the queue's parked state, since that
     tie is what sets such a queue aside.
     """
+    apply_folder_perms(root)
 
     def _mutate(meta: QueueMeta) -> QueueMeta:
         if parked:
@@ -1220,6 +1257,7 @@ def note_peak_mem(
     teach the queue anything. A record written without those keys reads as a queue with
     none pending, and behaves exactly as a queue that has only reported peaks.
     """
+    apply_folder_perms(root)
     if peak_mib is None or int(peak_mib) <= 0:
         return None
     peak = int(peak_mib)
@@ -1267,6 +1305,7 @@ def note_learned_mem_capped(root: Path, name: str, to_mib: int, host: str) -> No
     do not write over each other on every job. A record without these keys is one whose
     request no machine has had to cut down.
     """
+    apply_folder_perms(root)
     path = learned_mem_path(root, name)
     with file_lock(_learned_mem_lock_path(root, name)):
         state, rec = read_json_dict(path)
@@ -1308,6 +1347,7 @@ def claim_next(
     each pending job and the job is left for another pool when it says no. The default
     takes every pending job.
     """
+    apply_folder_perms(root)
     ensure_dir(_claims_dir(root, name))
     for job in load_jobs(root, name):
         jk = job.jobkey
@@ -1414,6 +1454,7 @@ def update_owner_gpu(root: Path, name: str, jobkey: str, gpu: int | None) -> Non
     GPU visible to ``jobq status`` while the job runs. Stays ``None`` for a declared
     CPU-only job (``slots: 0``), which reserves no GPU at all.
     """
+    apply_folder_perms(root)
     owner = read_owner(root, name, jobkey)
     if owner is None:
         return
@@ -1431,6 +1472,7 @@ def remove_claim(root: Path, name: str, jobkey: str) -> None:
         InvalidJobName: ``jobkey`` names something other than a direct child of the
             queue's claims directory; nothing is removed.
     """
+    apply_folder_perms(root)
     shutil.rmtree(_claim_dir(root, name, jobkey), ignore_errors=True)
 
 
@@ -1447,6 +1489,7 @@ def record_job_process(
     fast path, and what ``jobq status`` reads; the claim's ``run_id`` is what makes a
     survivor findable when this record is not there.
     """
+    apply_folder_perms(root)
     owner = read_owner(root, name, jobkey)
     if owner is None:
         logger.warning(
@@ -1829,6 +1872,7 @@ def steal_stale(
     ``should_stop()`` is asked between claims and while waiting for a surviving job to
     leave: when it says yes the pass returns what it has recovered so far.
     """
+    apply_folder_perms(root)
     grace_s = ORPHAN_CLAIM_GRACE_S if grace_s is None else grace_s
     if not _claims_dir(root, name).exists():
         return []
@@ -1977,6 +2021,7 @@ def force_release(root: Path, name: str, key: str) -> bool:
         InvalidJobName: the key names no job of this queue, or resolves to something other
             than a direct child of the claims directory.
     """
+    apply_folder_perms(root)
     jk = sanitize_jobkey(key)
     check_job_file_name(jk)
     if jk not in {job.jobkey for job in load_jobs(root, name)}:
@@ -2134,6 +2179,7 @@ def write_mem_floor(root: Path, name: str, jobkey: str, mem_mib: int) -> None:
 
     Lives here rather than in ``jobs.jsonl``, which is append-only and shared cross-machine.
     """
+    apply_folder_perms(root)
     _update_attempt_record(
         root, name, jobkey, lambda rec: rec.__setitem__("mem_mib_floor", int(mem_mib))
     )
@@ -2153,6 +2199,7 @@ def bump_oom_requeues(root: Path, name: str, jobkey: str) -> int:
 
     Lives in the attempts sidecar like ``mem_mib_floor``.
     """
+    apply_folder_perms(root)
     rec = _update_attempt_record(root, name, jobkey, lambda r: _bump_key(r, "oom_requeues"))
     return _as_int(rec["oom_requeues"])
 
@@ -2167,6 +2214,7 @@ def note_oom_requeue(
     read and rewrite the whole record, and a failure between them would leave a job
     counted but not escalated, or escalated without being counted.
     """
+    apply_folder_perms(root)
 
     def _mutate(rec: dict) -> None:
         if mem_mib_floor is not None:
@@ -2205,6 +2253,7 @@ def bump_tempfails(root: Path, name: str, jobkey: str, *, not_before: float) -> 
 
     Both keys live in the attempts sidecar like ``oom_requeues``.
     """
+    apply_folder_perms(root)
 
     def _mutate(rec: dict) -> None:
         _bump_key(rec, "tempfails")
@@ -2261,6 +2310,7 @@ def reset_mem_floors(
     affects its next claim. ``jobkeys`` restricts to named jobs; ``above_mib`` to floors
     strictly above that many MiB. Every other sidecar key is preserved.
     """
+    apply_folder_perms(root)
     cleared: list[tuple[str, int]] = []
     for jk, old in read_mem_floors(
         root, name, jobkeys=jobkeys, above_mib=above_mib
@@ -2308,6 +2358,7 @@ def bump_attempt(root: Path, name: str, jobkey: str) -> int:
     write happen inside one sidecar lock, so two concurrent bumps cannot both read the
     same value.
     """
+    apply_folder_perms(root)
     rec = _update_attempt_record(root, name, jobkey, lambda r: _bump_key(r, "attempt"))
     return _as_int(rec["attempt"])
 
@@ -2346,6 +2397,7 @@ def record_result(
     managed to start has none, and a record pointing at a file that is not there is
     worse than a record with no path in it.
     """
+    apply_folder_perms(root)
     jk = job.jobkey
     ensure_dir(_results_dir(root, name))
     ensure_dir(_attempt_path(root, name, jk).parent)
@@ -2441,6 +2493,7 @@ def requeue(
     it is gone the job is already pending and is skipped. Removing the claim before the
     result is safe because ``claim_next`` skips any job that has a result.
     """
+    apply_folder_perms(root)
     resume_queue(root, name)
     requeued: list[str] = []
     for jk, attempt in requeue_targets(root, name, failed_only=failed_only):
@@ -2471,14 +2524,22 @@ def requeue(
 # verdict and a pool restart changes nothing:
 #
 #   failures.json   {"streak": n, "keys": [...]}   the run of consecutive job failures
-#   paused.json     {"since_utc": ..., "keys": [...], "limit": n}   present while paused
+#   paused.json     {"since_utc": ..., "until_utc": ..., "keys": [...], "limit": n,
+#                    "probe_utc": ...}
+#                   present while paused; ``until_utc`` is absent when the pause never ends;
+#                   ``probe_utc`` is the moment one job was last let through to try the queue
 #
 # Both are written under ``<queue>/.failures.lock``, so two pools finishing failing jobs at
 # the same moment cannot lose a count or disagree about whether the queue is paused. A pool
-# deciding whether it may claim only stats paused.json.
+# deciding whether it may claim reads paused.json. Once ``until_utc`` has passed, the first
+# worker to take the lock (:func:`take_pause_probe`) moves ``until_utc`` on by the pause
+# length and claims one job, the probe; every other worker reads the queue as paused. A
+# success removes the pause; a failure leaves it in place until the new ``until_utc``.
 
 # Consecutive job failures that pause a queue when its meta names no other number.
 DEFAULT_MAX_CONSECUTIVE_FAILURES = 5
+# Seconds a failure pause lasts when the caller names no other number; 0 never lapses.
+DEFAULT_FAILURE_PAUSE_S = 900.0
 
 
 def failures_path(root: Path, name: str) -> Path:
@@ -2501,13 +2562,46 @@ def max_consecutive_failures(meta: QueueMeta) -> int:
     return max(0, _as_int(raw, DEFAULT_MAX_CONSECUTIVE_FAILURES))
 
 
+def pause_left_s(rec: dict) -> float | None:
+    """Seconds until a pause record lapses; ``None`` when it never does (no ``until_utc``).
+
+    An ``until_utc`` that cannot be read counts as never lapsing, so a damaged record keeps
+    the queue paused rather than handing it back to the pools.
+    """
+    until = rec.get("until_utc")
+    if not until:
+        return None
+    try:
+        end = datetime.fromisoformat(str(until))
+    except ValueError:
+        return None
+    if end.tzinfo is None:
+        end = end.replace(tzinfo=UTC)
+    return end.timestamp() - time.time()
+
+
+def _pause_active(rec: dict | None) -> bool:
+    if rec is None:
+        return False
+    left = pause_left_s(rec)
+    return left is None or left > 0
+
+
 def queue_paused(root: Path, name: str) -> bool:
-    """Whether the queue is paused — one stat, which is what the claim loop calls."""
-    return paused_path(root, name).exists()
+    """Whether the queue is paused now: a pause record exists and has not lapsed.
+
+    A missing file costs one stat, which is what the claim loop pays for most queues.
+    """
+    if not paused_path(root, name).exists():
+        return False
+    return _pause_active(read_pause(root, name))
 
 
 def read_pause(root: Path, name: str) -> dict | None:
-    """The pause record (``since_utc``, ``keys``, ``limit``), or None when not paused.
+    """The pause record (``since_utc``, ``until_utc``, ``keys``, ``limit``), or None.
+
+    None means no record. A record whose ``until_utc`` has passed is still returned (see
+    :func:`queue_paused` for whether it holds).
 
     An unreadable record still reports a pause (with empty detail): the file's presence is
     the decision, and failing open would hand the queue back to the pools.
@@ -2557,13 +2651,19 @@ def _set_aside_unreadable_failures(root: Path, name: str) -> None:
     )
 
 
-def note_job_failure(root: Path, name: str, jobkey: str, limit: int) -> bool:
+def note_job_failure(
+    root: Path, name: str, jobkey: str, limit: int,
+    pause_s: float = DEFAULT_FAILURE_PAUSE_S,
+) -> bool:
     """Extend the run of job failures; return whether this call paused the queue.
 
-    ``limit`` of 0 disables the feature for the queue, and nothing is written. Only a job
+    ``limit`` of 0 disables the feature for the queue, and nothing is written. The pause
+    lasts ``pause_s`` seconds (0: until ``jobq resume``). A failure while the run is at or
+    above ``limit`` and the pause has lapsed pauses the queue again. Only a job
     process that exited non-zero on its own belongs here — see the worker for the exits
     that are the pool's fault or a retry rather than the job's failure.
     """
+    apply_folder_perms(root)
     if limit <= 0:
         return False
     ensure_dir(queue_dir(root, name))
@@ -2577,32 +2677,64 @@ def note_job_failure(root: Path, name: str, jobkey: str, limit: int) -> bool:
         atomic_write_json(failures_path(root, name), {"streak": streak, "keys": keys})
         if streak < limit or paused_path(root, name).exists():
             return False
-        atomic_write_json(
-            paused_path(root, name),
-            {"since_utc": now_iso(), "keys": keys, "limit": limit},
-        )
+        now = datetime.now(UTC)
+        rec = {"since_utc": now.isoformat(), "keys": keys, "limit": limit}
+        if pause_s > 0:
+            rec["until_utc"] = (now + timedelta(seconds=pause_s)).isoformat()
+        atomic_write_json(paused_path(root, name), rec)
+        return True
+
+
+def take_pause_probe(
+    root: Path, name: str, pause_s: float = DEFAULT_FAILURE_PAUSE_S
+) -> bool:
+    """Claim the one probe of a lapsed pause; return whether this caller got it.
+
+    Under the failures lock, a pause whose ``until_utc`` has passed is rewritten with
+    ``until_utc`` = now + ``pause_s`` and ``probe_utc`` = now, so every other worker reads
+    the queue as paused again and only the caller tries a job. A pause still in force, one
+    that never ends, or no pause at all returns False and writes nothing.
+    """
+    if not paused_path(root, name).exists():
+        return False
+    with file_lock(_failures_lock_path(root, name)):
+        rec = read_pause(root, name)
+        if rec is None or pause_left_s(rec) is None or _pause_active(rec):
+            return False
+        now = datetime.now(UTC)
+        rec = {**rec, "probe_utc": now.isoformat()}
+        if pause_s > 0:
+            rec["until_utc"] = (now + timedelta(seconds=pause_s)).isoformat()
+        else:
+            rec.pop("until_utc", None)
+        atomic_write_json(paused_path(root, name), rec)
         return True
 
 
 def note_job_success(root: Path, name: str) -> None:
-    """Reset the run of job failures. Never resumes a paused queue (only ``resume`` does).
+    """Reset the run of job failures and remove any pause.
+
+    A success shows the queue's jobs can run, whether it is the probe of a lapsed pause or
+    a job that was already running when the queue paused.
 
     The record is looked at only under the failures lock, so a job finishing here and a
     job failing on another machine cannot interleave a read of one with a write of the
     other.
     """
+    apply_folder_perms(root)
     if not queue_dir(root, name).is_dir():
         return
     with file_lock(_failures_lock_path(root, name)):
         failures_path(root, name).unlink(missing_ok=True)
+        paused_path(root, name).unlink(missing_ok=True)
 
 
 def resume_queue(root: Path, name: str) -> bool:
     """Clear a queue's pause and its run of failures; return whether it was paused.
 
-    The only way out of a pause: nothing here runs on a timer, on a new submission or on a
-    later success.
+    Besides a job succeeding, the only way out of a pause.
     """
+    apply_folder_perms(root)
     if not queue_dir(root, name).is_dir():
         return False
     with file_lock(_failures_lock_path(root, name)):
@@ -2703,6 +2835,7 @@ def complete_state_path(root: Path, name: str) -> Path:
 
 def drop_complete_cache(root: Path, name: str) -> None:
     """Invalidate a queue's completion cache, so the next check re-derives it."""
+    apply_folder_perms(root)
     complete_state_path(root, name).unlink(missing_ok=True)
 
 
@@ -2755,6 +2888,7 @@ def queue_complete(root: Path, name: str) -> bool:
     an mtime older than the cache, and the queue would then be reported complete with
     pending work in it.
     """
+    apply_folder_perms(root)
     if not queue_exists(root, name):
         return False
     if complete_cache_valid(root, name):
@@ -2836,6 +2970,7 @@ def write_worker_info(root: Path, hostname: str, *, pid: int, log: str) -> None:
     mistaken for a live pool. The heartbeat starts here and is refreshed on every
     supervisor tick (:func:`write_heartbeat`).
     """
+    apply_folder_perms(root)
 
     def _mutate(info: dict) -> None:
         info.clear()
@@ -2861,6 +2996,7 @@ def write_heartbeat(root: Path, hostname: str) -> None:
     only: the claims of a machine that falls silent are still recovered by that machine's
     own pool. Best-effort, like the rest of the sidecar.
     """
+    apply_folder_perms(root)
     _update_worker_info(
         root, hostname, lambda info: info.__setitem__("heartbeat_utc", now_iso())
     )
@@ -2897,6 +3033,7 @@ def mark_pool_draining(root: Path, hostname: str) -> None:
     nothing else to read it from. Best-effort: the note is a convenience for the reader,
     not something the pool's behaviour depends on.
     """
+    apply_folder_perms(root)
     def _mutate(info: dict) -> bool | None:
         if not worker_info_path(root, hostname).exists():
             return False  # no pool has recorded itself here; nothing to annotate
@@ -3029,6 +3166,7 @@ def remove_stale_temp_files(root: Path, *, max_age_s: float = TEMP_FILE_MAX_AGE_
     into place; a process killed in between leaves the temporary file, which nothing will
     ever rename or read. Returns the paths removed.
     """
+    apply_folder_perms(root)
     removed: list[str] = []
     root = Path(root)
     dirs = [root]

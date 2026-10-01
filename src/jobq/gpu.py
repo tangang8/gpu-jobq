@@ -99,6 +99,7 @@ DEFAULT_POLL_S = 20.0
 DEFAULT_GPU_WAIT_S = 5.0
 DEFAULT_SUPERVISE_S = 30.0
 DEFAULT_ORPHAN_CLAIM_GRACE_S = 120.0
+DEFAULT_FAILURE_PAUSE_S = store.DEFAULT_FAILURE_PAUSE_S
 DEFAULT_MEM_CHECKS = 2
 DEFAULT_MEM_INTERVAL_S = 3.0
 DEFAULT_MEM_FASTPATH_FACTOR = 2.0
@@ -135,6 +136,7 @@ class Tunables:
     park_defer_max_s: float = DEFAULT_PARK_DEFER_MAX_S
     kill_grace_s: float = DEFAULT_KILL_GRACE_S
     orphan_claim_grace_s: float = DEFAULT_ORPHAN_CLAIM_GRACE_S
+    failure_pause_s: float = DEFAULT_FAILURE_PAUSE_S
 
 
 @dataclass
@@ -174,8 +176,8 @@ class GpuPolicy:
         oom_patterns: Log-tail patterns that classify a failure as out-of-memory. Empty (the
             default) uses the built-in CUDA/PyTorch markers; a non-empty list replaces them.
         cwd_fallback: Directory to run a job in when the directory it asks for does not
-            exist on this machine. Unset (the default) makes such a job fail with a message
-            naming both the directory and this key.
+            exist on this machine. Unset (the default) leaves such a job to other machines,
+            with a pool log line naming the directory and this key.
         env: Environment entries added to every job this machine dispatches.
         mem_budget_mib: Cap on the memory this queue folder's own jobs may commit on one
             GPU (0 = unset, no budget). A job is admitted only if the asks of the jobs
@@ -235,6 +237,8 @@ class GpuPolicy:
         supervise_s: Supervisor tick (respawn, hot-scale, janitors).
         orphan_claim_grace_s: How old a claim directory with no owner record must be
             before any machine may reclaim it.
+        failure_pause_s: How long a queue paused by a run of job failures stays paused
+            before one job is tried again; 0 keeps it paused until ``jobq resume``.
 
     The ``yield_*`` fields configure the opt-in GPU-yielding framework (see
     :mod:`jobq.yielding`). They are all defaulted and the feature is off unless
@@ -313,6 +317,7 @@ class GpuPolicy:
     gpu_wait_s: float = DEFAULT_GPU_WAIT_S
     supervise_s: float = DEFAULT_SUPERVISE_S
     orphan_claim_grace_s: float = DEFAULT_ORPHAN_CLAIM_GRACE_S
+    failure_pause_s: float = DEFAULT_FAILURE_PAUSE_S
     # Utilisation sampling and the pool heartbeat (see jobq.monitor).
     monitor_interval_s: float = monitor.DEFAULT_MONITOR_INTERVAL_S
     monitor_idle_util_pct: float = monitor.DEFAULT_MONITOR_IDLE_UTIL_PCT
@@ -367,6 +372,7 @@ class GpuPolicy:
             park_defer_max_s=self.park_defer_max_s,
             kill_grace_s=self.kill_grace_s,
             orphan_claim_grace_s=self.orphan_claim_grace_s,
+            failure_pause_s=self.failure_pause_s,
         )
 
     @classmethod
@@ -459,6 +465,9 @@ class GpuPolicy:
             ),
             orphan_claim_grace_s=_number(
                 d, "orphan_claim_grace_s", DEFAULT_ORPHAN_CLAIM_GRACE_S, low=0.0
+            ),
+            failure_pause_s=_number(
+                d, "failure_pause_s", DEFAULT_FAILURE_PAUSE_S, low=0.0
             ),
             monitor_interval_s=_number(
                 d, "monitor_interval_s", monitor.DEFAULT_MONITOR_INTERVAL_S, low=0.0

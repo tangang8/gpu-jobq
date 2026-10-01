@@ -3,8 +3,9 @@
 Queue state is written atomically (temp file in the same directory + ``os.replace``), so a
 reader on any machine sees either the old complete file or the new one, never a torn mix.
 
-Permissions follow the user's umask by default. A machine whose policy sets ``shared_perms``
-calls :func:`set_shared_perms` at pool startup; from then on this process creates queue
+Permissions follow the user's umask by default. When the policy of this machine sets
+``shared_perms``, :func:`set_shared_perms` is called before the first write into the folder
+(see :func:`jobq.store.apply_folder_perms`); from then on this process creates queue
 state world-writable, which is what lets one person reach the same queue folder from
 machines where their account has a different user id.
 """

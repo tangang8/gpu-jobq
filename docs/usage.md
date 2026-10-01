@@ -197,8 +197,9 @@ files activating an environment. For example, use
 `/shared/me/project/.venv/bin/python train.py` in `cmd` when appropriate.
 
 If the requested working directory is unavailable, jobq tries the machine
-policy's `cwd_fallback`. If neither is usable, the job receives a failed
-result. Use absolute paths in per-job `cwd`; relative paths are interpreted
+policy's `cwd_fallback`. If neither is usable, the job is not run on this
+machine and stays pending for other machines; the pool log says so once per
+queue with a `WAIT` line. Use absolute paths in per-job `cwd`; relative paths are interpreted
 from the pool's working directory. A fallback does not translate paths inside
 your command or copy missing files.
 

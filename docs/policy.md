@@ -198,6 +198,7 @@ markers on the next successful watchdog pass.
 | `reserve_max_gpus` | `1` | How many GPUs of this machine may be held for waiting jobs at once. |
 | `kill_grace_s` | `20` | Time allowed after `SIGTERM` before attempting `SIGKILL` for a job being terminated by the pool. |
 | `orphan_claim_grace_s` | `120` | Minimum age before reclaiming a claim with no owner record; also requires two sightings at least five seconds apart. |
+| `failure_pause_s` | `900` | How long a queue paused by a run of failures stays paused before one job is tried; a success lifts the pause, a failure extends it by this long. `0` keeps it paused until `resume`, `requeue`, or a success of a job already running. The policy of the machine whose failure sets the pause, or whose worker tries the job, decides. |
 
 A job whose request is larger than the memory smaller jobs keep taking would
 otherwise wait for ever. Once such a job has waited `reserve_after_s`, and its
@@ -233,7 +234,7 @@ so they survive pool restarts. Exhausted automatic retries produce failed
 results but do not count toward the queue's consecutive-failure pause.
 The pause threshold is a queue setting, configured by
 `submit --max-consecutive-failures` (default `5`; `0` disables it), not a policy
-key. See [retry and recovery commands](troubleshooting.md).
+key; how long the pause lasts is the policy key `failure_pause_s`. When the pause ends one job is tried; a success lifts the pause, a failure extends it by `failure_pause_s`. See [retry and recovery commands](troubleshooting.md).
 
 ## Pool timing
 
@@ -268,6 +269,13 @@ Locks use `/tmp/jobq_<root-hash>`, derived from the queue folder. Explicit
 `JOBQ_LOCK_PREFIX`, then that default. Keep capacity locks local to the
 machine; the queue state itself is what belongs on shared storage. All pools
 sharing a lock namespace need compatible GPU indices and limits.
+
+Every writer that uses the folder, the command line, the pool and programs
+importing `jobq.store` alike, follows the policy of the machine it runs on: a
+program calling `jobq.store` functions such as `create_queue` or
+`append_jobs` reads this machine's policy for that folder once and creates
+queue state world-writable when it sets `shared_perms`. Only the command line
+and the pool also set the umask to `0`.
 
 `shared_perms` is for a trusted shared location when the same person's numeric
 UID differs between machines. It broadens access to both jobq state and files

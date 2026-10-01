@@ -12,7 +12,8 @@ under `logs/` in the queue folder for scheduling decisions.
 | Symptom | Check or action |
 | --- | --- |
 | `pending` jobs, no active pool | Start `jobq work`; a pool exits after completing its eligible queues and does not remain as a submission service. |
-| `PAUSED` queue | Fix the error shown in failed job logs, then use `requeue` or `resume` below. |
+| `PAUSED` queue | Fix the error shown in failed job logs, then use `requeue` or `resume` below. Status shows how long the pause has left; when it ends one job is tried; a success lifts the pause, a failure extends it by `failure_pause_s`. |
+| Pool log `WAIT queue <name>: working directory ... is not reachable on this machine` | The directory the queue's or job's `cwd` names is missing here and `cwd_fallback` is unset or missing too. The jobs stay pending for machines where the directory exists; create the directory or set `cwd_fallback`, then restart the pool here. |
 | `deferred` jobs | Exit-75 retries wait until `not_before`; status prints the earliest retry time. Unreadable attempt records can also defer claims. |
 | A claimed job says `running`, but no GPU is assigned | It may be waiting for capacity. A claim is acquired before a GPU slot. A CPU-only job also has no GPU assignment. |
 | `WAIT` for capacity | Compare the job's request and OOM floor with free memory, reserves, budgets, yielded GPUs, and both machine and queue caps. |
@@ -73,10 +74,17 @@ they are held for.
 
 An ordinary nonzero exit creates a failed result. Five consecutive counted
 job failures pause the queue by default. The count follows completion order,
-and a successful job clears the current streak. The pause blocks new
+and a successful job clears the current streak and any pause. The pause blocks new
 selection, and it cannot stop the jobs that were already claimed when it was
 set: those run to the end and record their results, so with many workers a few
 more failures than the limit can occur before the queue stops.
+
+The pause lasts `failure_pause_s` seconds of the policy of the machine whose
+job failure set it (default `900`; `0` keeps it until `resume` or `requeue`).
+When it ends one worker on one machine tries one job, and its pool log has a line
+`PAUSE LAPSED <queue>: the failure pause ended; trying one job again`; every
+other worker treats the queue as paused meanwhile. A success lifts the pause,
+and a failure extends it by `failure_pause_s` of the trying machine's policy.
 
 Set the threshold when creating the queue:
 
@@ -90,8 +98,7 @@ a GPU do not extend the streak: none of them is an outcome. A job that runs out
 of those retries, or that runs out of memory while already asking for all a GPU
 can grant, does extend it — the job failed for a reason of its own, and a queue
 whose jobs all do that is what the pause is for. Only a fault of the pool itself
-(it could not reach the working directory, could not open the log, could not
-update the attempts record) records a failed result without extending the
+(it could not open the log, could not update the attempts record) records a failed result without extending the
 streak; those results carry `not_failure_reason`.
 
 After fixing the cause:

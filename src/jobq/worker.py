@@ -15,9 +15,11 @@ framework (:mod:`jobq.yielding`) adds YIELD gpu=N foreign=K, KILL <queue> <key> 
 DRAIN <queue> <key> gpu=N pct=P (finishing) (a near-done job spared under
 drain_if_near_done), and RECLAIM gpu=N. PAUSE <queue> ... / RESUME <queue> report a queue
 that stopped being claimed after a run of consecutive job failures, and the ``jobq resume``
-that ended it. SIDECAR <queue> <key> ... reports a job made
-terminal because this pool could not update its attempts sidecar. CWD <queue> <key> ...
-reports a job failed because its working directory is unreachable on this machine. The
+or success that ended it; PAUSE LAPSED <queue>: ... reports a pause that ran out, after
+which this worker alone claims one job to try the queue. SIDECAR <queue> <key> ... reports a job made
+terminal because this pool could not update its attempts sidecar. WAIT queue <queue>:
+working directory ... is not reachable ... reports a queue whose jobs are left for other
+machines because the directory they run in is missing here. The
 requeue paths add OOM REQUEUE / OOM CEILING / OOM BACKSTOP, TEMPFAIL / TEMPFAIL BACKSTOP
 and YIELD REQUEUE, and the supervisor adds RESPAWN, SCALE and REAP. An interrupt or a
 termination signal asks the pool to drain and logs DRAIN REQUEST ...; ``jobq stop --now``
@@ -149,11 +151,14 @@ _TUNABLE_FALLBACKS = {
     "park_defer_max_s": "PARK_DEFER_MAX_S",
     "kill_grace_s": "KILL_GRACE_S",
     "orphan_claim_grace_s": "ORPHAN_CLAIM_GRACE_S",
+    "failure_pause_s": "FAILURE_PAUSE_S",
 }
 # Seconds between the termination signal and the kill signal in a force-kill.
 KILL_GRACE_S = gpu_defaults.DEFAULT_KILL_GRACE_S
 # How old an owner-less claim must be before any machine may reclaim it.
 ORPHAN_CLAIM_GRACE_S = store.ORPHAN_CLAIM_GRACE_S
+# How long a failure pause lasts before one job is tried again (0: until jobq resume).
+FAILURE_PAUSE_S = gpu_defaults.DEFAULT_FAILURE_PAUSE_S
 
 # Default out-of-memory markers: generic CUDA / PyTorch messages. A machine's policy may
 # replace them wholesale with its own ``oom_patterns``.
@@ -488,7 +493,7 @@ def resolve_cwd(cwd: str | None, fallback: str | None) -> str | None:
     ``None`` in and ``None`` out means "inherit the pool's directory". A named directory
     that is reachable here is used as-is; one that is not falls back to the policy's
     ``cwd_fallback`` when that is itself reachable, and otherwise raises
-    :class:`CwdUnreachable` so the job is recorded as failed with a message naming both.
+    :class:`CwdUnreachable`, and the pool leaves the job to other machines.
     """
     if cwd is None:
         return None
@@ -591,6 +596,13 @@ class _Pool:
         # Queues this pool has already logged a PAUSE for, so the line appears once per
         # pause rather than once per claim-loop pass.
         self._paused_seen: set[str] = set()
+        # The queue whose lapsed pause this thread took the probe of in its current pass.
+        self._probe_tls = threading.local()
+        # Queues whose unreachable working directory this pool has reported, and the jobs
+        # it handed back because their own working directory is unreachable here: those
+        # are left to other machines and never claimed again by this pool.
+        self._cwd_warned: set[str] = set()
+        self._cwd_skipped: set[tuple[str, str]] = set()
         # Queues whose zero memory ask this pool has already reported raising to the
         # machine's smallest grantable one (see _effective_mem), once per queue.
         self._zero_ask_queues: set[str] = set()
@@ -740,13 +752,21 @@ class _Pool:
         A queue whose GPU tie names no GPU this machine's policy selects is still
         claimable here for the jobs that take no GPU, and only for those: a job of it
         that wants a GPU has none to wait for here and is left to a machine the tie
-        allows.
+        allows. A job this pool handed back because its working directory is unreachable
+        here is not taken again.
         """
+        name = meta.name
+        with self._lock:
+            skipped = {k for q, k in self._cwd_skipped if q == name}
         allowed = self._tie_gpus(meta)
         if allowed is None or allowed:
-            return None
+            if not skipped:
+                return None
+            return lambda job: job.jobkey not in skipped
         default = int(meta.defaults.get("slots", 1))
-        return lambda job: (default if job.slots is None else job.slots) == 0
+        return lambda job: (
+            (default if job.slots is None else job.slots) == 0 and job.jobkey not in skipped
+        )
 
     def _has_cpu_only_job(self, meta: QueueMeta) -> bool:
         """Whether any job of a queue takes no GPU, by its own field or the queue default.
@@ -812,10 +832,29 @@ class _Pool:
     def _observe_pause(self, name: str) -> bool:
         """Whether ``name`` is paused right now; logs the change once per pause.
 
-        One stat per queue per pass — the claim loop must not read result files to learn
-        this. The record behind the flag is only read when the PAUSE line is written.
+        One stat per queue per pass while no pause file exists — the claim loop must not
+        read result files to learn this. When a pause's ``until_utc`` has passed, the one
+        worker that takes the probe (:func:`store.take_pause_probe`) logs ``PAUSE LAPSED``
+        and claims one job; one cleared by a success or ``jobq resume`` is logged as
+        ``RESUME``.
         """
         paused = store.queue_paused(self.root, name)
+        probe = False
+        if not paused and store.paused_path(self.root, name).exists():
+            # A lapsed pause: one worker on one machine takes the probe under the lock;
+            # every other one, and a draining pool, reads the queue as still paused.
+            probe = not self.draining.is_set() and store.take_pause_probe(
+                self.root, name, self._tunable("failure_pause_s")
+            )
+            paused = not probe and store.paused_path(self.root, name).exists()
+        if probe:
+            self._probe_tls.queue = name
+            with self._lock:
+                self._paused_seen.add(name)
+            self.master.log(
+                "PAUSE", f"LAPSED {name}: the failure pause ended; trying one job again"
+            )
+            return False
         with self._lock:
             seen = name in self._paused_seen
             if paused and not seen:
@@ -845,6 +884,7 @@ class _Pool:
         normally, since nothing here touches a claim that exists.
         """
         ready: list[tuple[str, QueueMeta]] = []
+        self._probe_tls.queue = None
         for name in self._node_queues():
             # A queue whose files this uid cannot read (written from another machine under a
             # restrictive umask) would otherwise raise PermissionError here and crash every
@@ -861,6 +901,9 @@ class _Pool:
                     continue
                 if not self._deps_ok(meta):
                     continue
+                if self._queue_cwd_unreachable(meta) is not None:
+                    self._log_cwd_unreachable(name, str(meta.defaults.get("cwd")))
+                    continue
             except (PermissionError, store.QueueMetaUnreadable) as e:
                 # The queue itself, or one of the queues it depends on.
                 self._log_unreadable(name, e)
@@ -868,6 +911,39 @@ class _Pool:
             ready.append((name, meta))
         ready.sort(key=lambda nm: store.queue_order_key(nm[1]))
         return ready
+
+    def _queue_cwd_unreachable(self, meta: QueueMeta) -> str | None:
+        """Why the queue's default working directory cannot be used here, or ``None``."""
+        d = meta.defaults.get("cwd")
+        if d is None:
+            return None
+        try:
+            resolve_cwd(str(d), self._cwd_fallback())
+        except CwdUnreachable:
+            return (
+                f"working directory {d} is not reachable on this machine and the policy "
+                "sets no usable cwd_fallback"
+            )
+        return None
+
+    def _log_cwd_unreachable(self, name: str, cwd: str) -> None:
+        """Say once per queue that its jobs are left for other machines."""
+        with self._lock:
+            if name in self._cwd_warned:
+                return
+            self._cwd_warned.add(name)
+        self.master.log(
+            "WAIT",
+            f"queue {name}: working directory {cwd} is not reachable on this machine and "
+            "the policy sets no usable cwd_fallback; its jobs are left for other machines",
+        )
+
+    def _hand_back_cwd(self, name: str, job: Job, cwd: str) -> None:
+        """Hand back a claimed job whose own working directory is unreachable here."""
+        with self._lock:
+            self._cwd_skipped.add((name, job.jobkey))
+        store.remove_claim(self.root, name, job.jobkey)
+        self._log_cwd_unreachable(name, cwd)
 
     def _log_unreadable(self, name: str, err: Exception) -> None:
         with self._lock:
@@ -963,6 +1039,8 @@ class _Pool:
                 aside[name] = "tied to machines this one is not among"
             elif not self._tie_allows_here(meta):
                 aside[name] = "tied to GPUs this machine's policy does not select"
+            elif self._queue_cwd_unreachable(meta) is not None:
+                aside[name] = self._queue_cwd_unreachable(meta)
             elif name in reason:
                 # Including the queues stuck in themselves. A queue that holds no jobs
                 # is never complete and never will be, so a pool that waited for it
@@ -1290,7 +1368,9 @@ class _Pool:
             return f"its queue's settings cannot be read ({exc})"
         if meta.parked:
             return "its queue has been parked"
-        if store.queue_paused(self.root, name):
+        if store.queue_paused(self.root, name) and getattr(
+            self._probe_tls, "queue", None
+        ) != name:
             return "its queue has been paused"
         if not meta.allows_machine(self.hostname):
             return "its queue is not tied to this machine any more"
@@ -1629,10 +1709,11 @@ class _Pool:
         env[store.RUN_ID_ENV] = run_id
         try:
             cwd = resolve_cwd(self._effective_cwd(meta, job), self._cwd_fallback())
-        except CwdUnreachable as exc:
-            self._cwd_failure(name, job, exc, settled, slot=slot, start=start,
-                              log_path=log_path, attempt=attempt)
-            return 1
+        except CwdUnreachable:
+            # The directory went away after the claim: left for other machines as well.
+            self._hand_back_cwd(name, job, self._effective_cwd(meta, job) or "")
+            settled.append(True)
+            return None
         try:
             log_file = open(log_path, "w")
         except OSError as exc:
@@ -1793,15 +1874,18 @@ class _Pool:
                 store.note_job_success(self.root, name)
                 return
             limit = store.max_consecutive_failures(meta)
-            if store.note_job_failure(self.root, name, job.jobkey, limit):
+            pause_s = self._tunable("failure_pause_s")
+            if store.note_job_failure(self.root, name, job.jobkey, limit, pause_s):
                 with self._lock:
                     self._paused_seen.add(name)
                 rec = store.read_pause(self.root, name) or {}
                 keys = ", ".join(str(k) for k in (rec.get("keys") or [])) or "-"
+                until = rec.get("until_utc")
                 self.master.log(
                     "PAUSE",
                     f"{name} paused: {limit} consecutive job failures ({keys}); "
-                    f"no pool will claim from it until: jobq resume {name}",
+                    + (f"no pool will claim from it until {until} or: jobq resume {name}"
+                       if until else f"no pool will claim from it until: jobq resume {name}"),
                 )
         except OSError as exc:
             # The job is already terminal; losing the count must not turn into a crash on
@@ -1877,38 +1961,6 @@ class _Pool:
         store.remove_claim(self.root, name, job.jobkey)
         settled.append(True)
         self.master.log(verb, f"{name} {job.key} {detail}")
-
-    def _cwd_failure(
-        self, name: str, job: Job, exc: Exception, settled: list, *, slot,
-        start: str, log_path: Path, attempt: int,
-    ) -> None:
-        """Record a job as FAILED because its working directory is unreachable here.
-
-        The message names the directory and the ``cwd_fallback`` policy key, both in the
-        job's own log and in the master log, so the fix is visible from either side.
-        """
-        try:
-            with open(log_path, "a") as f:
-                f.write(f"jobq: {exc}\n")
-        except OSError:
-            pass
-        try:
-            store.record_result(
-                self.root, name, job,
-                rc=1,
-                node=self.hostname,
-                gpu=slot.gpu,
-                start_utc=start,
-                end_utc=now_iso(),
-                log=str(log_path),
-                attempt=attempt,
-                not_failure_reason="working directory unreachable on this machine",
-            )
-        except store.AttemptRecordUnreadable:
-            pass  # the result file itself is written before the counter
-        store.remove_claim(self.root, name, job.jobkey)
-        settled.append(True)
-        self.master.log("CWD", f"{name} {job.key} {exc}")
 
     def yield_kill_gpu(self, gpu: int, spec: yielding.DrainSpec | None = None) -> None:
         """Yield ``gpu`` (called by the watchdog); kill our jobs there, or spare near-done ones.
@@ -2336,6 +2388,12 @@ class _Pool:
         self._claim_note(name, job.jobkey)
         slot = None
         try:
+            if job.cwd is not None:
+                try:
+                    resolve_cwd(job.cwd, self._cwd_fallback())
+                except CwdUnreachable:
+                    self._hand_back_cwd(name, job, job.cwd)
+                    return "next"
             mem_mib = self._effective_mem(name, meta, job)
             slots = self._effective_slots(meta, job)
             # A job that declares ``slots: 0`` takes the CPU lane whatever its queue's

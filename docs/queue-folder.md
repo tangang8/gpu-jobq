@@ -136,7 +136,6 @@ and then one of these verbs.
 | `ALL QUEUES COMPLETE` | The pool left and every queue in the folder is complete. |
 | `CLAIM` | A job was claimed by this pool. |
 | `CLAIM KEPT` | Claim recovery looked at a claim and left it where it is, with the reason. |
-| `CWD` | A job failed because the directory it asks to run in is unreachable here. |
 | `DRAIN` | A nearly finished job on a yielded GPU is spared and left to finish. |
 | `DRAIN REQUEST` | A signal asked the pool to finish its jobs and claim nothing new. |
 | `END` | A job finished, with its exit code and any peak-memory reading. |
@@ -148,7 +147,7 @@ and then one of these verbs.
 | `OOM BACKSTOP` | A job used up its out-of-memory retries, so the exit counts as a failure. |
 | `OOM CEILING` | A job ran out of memory while already asking for all a GPU here can grant. |
 | `OOM REQUEUE` | A job that ran out of memory is pending again with a higher request. |
-| `PAUSE` | A queue stopped being claimed after a run of consecutive job failures. |
+| `PAUSE` | A queue stopped being claimed after a run of consecutive job failures, with the time the pause ends. `PAUSE LAPSED <queue>` says the pause has ended and this worker tries one job while the queue stays paused for every other worker. |
 | `POOL EXIT` | The pool left with work outstanding, and why. |
 | `QUEUE COMPLETE` | Every job of one queue is terminal. |
 | `REAP` | Debris was removed: a leftover temporary file, an orphan claim of this pool, or a leaked slot lock. |
@@ -164,7 +163,7 @@ and then one of these verbs.
 | `STEAL` | A claim left behind by a pool that is gone was handed back to the queue. |
 | `TEMPFAIL` | A job exited 75 and is deferred until its retry time. |
 | `TEMPFAIL BACKSTOP` | A job did that too often, so the exit counts as a failure. |
-| `WAIT` | A worker is waiting for capacity, or the pool says why its workers are leaving. |
+| `WAIT` | A worker is waiting for capacity, the pool says why its workers are leaving, or a queue's jobs are left for other machines because their working directory is not reachable here. |
 | `WORKERS` | The thread count the pool chose at startup and the figures behind it. |
 | `YIELD` | A GPU was yielded to another user, with the foreign process count. |
 
@@ -211,7 +210,7 @@ yielded ones times the cap in force), how many claimed jobs wait for capacity
 | `results/<jobkey>.json` | Terminal exit code, machine, GPU, timestamps, log path, attempt, optional memory readings (`peak_mem_mib` and `peak_mem_alloc_mib` as the job reported them, `measured_mem_mib` as the pool measured it from the GPU) and failure reason | `requeue` removes selected results to make jobs pending again |
 | `attempts/<jobkey>.json` | Attempt counter, OOM retries, exit-75 retries, memory floor, retry time | `requeue`, `requeue --reset-oom`, or `reset-mem-floor`, depending on the field |
 | `failures.json` | Consecutive counted failures and their keys | `resume` or `requeue` clears the streak; a success also clears it |
-| `paused.json` | Persistent queue pause | `resume` or `requeue`; later success alone does not clear it |
+| `paused.json` | Queue pause: `since_utc`, `until_utc` (absent when the pause does not end by itself), `keys` of the failures behind it, `limit`, and `probe_utc` (when one job was last let through after the pause ended) | At `until_utc` one worker rewrites `until_utc` to now plus `failure_pause_s`, sets `probe_utc`, and tries one job; any job success removes the file; `resume` or `requeue` removes it at once |
 | `failures.unreadable.<stamp>.json` | Unreadable failure state preserved for inspection | Inspect before removing |
 | `complete.state.json` | Completion cache based on jobs-file size and result count | Automatically checked; removing it only costs a fresh completion scan |
 | `logs/<stamp>_<jobkey>.a<attempt>.<hostname>.log` | Combined stdout/stderr plus a job header, one file per attempt so the out-of-memory classification reads this attempt's output alone | Read directly; a result that has a log names it in `log` |

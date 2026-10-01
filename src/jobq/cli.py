@@ -162,14 +162,10 @@ def apply_shared_perms(root: Path) -> None:
 
     The pool reads the same key at startup. A command that writes into the queue folder
     without it would create files the same account cannot rewrite from another machine,
-    which is the whole point of the setting.
+    which is the whole point of the setting. A command also sets ``umask 0``, which a
+    program importing :mod:`jobq.store` is left to decide for itself.
     """
-    try:
-        policy = load_policy(root, store.this_host())
-    except (FileNotFoundError, PolicyError):
-        return
-    if policy.shared_perms:
-        jobq_io.set_shared_perms(True)
+    if store.apply_folder_perms(root):
         os.umask(0)
 
 
@@ -928,10 +924,17 @@ def _report_root(
         pause = store.read_pause(root, name)
         if pause is not None:
             keys = ", ".join(str(k) for k in (pause.get("keys") or [])) or "-"
+            left = store.pause_left_s(pause)
+            if left is None:
+                ends = "until resumed"
+            elif left > 0:
+                ends = f"{summary_mod.duration_text(left)} left"
+            else:
+                ends = "lapsed, the next job is tried"
             out(
-                "    PAUSED since {} after {} consecutive job failures: {} "
+                "    PAUSED since {} after {} consecutive job failures: {}; {} "
                 "(resume with: jobq resume {})",
-                pause.get("since_utc", "?"), pause.get("limit", "?"), keys, name,
+                pause.get("since_utc", "?"), pause.get("limit", "?"), keys, ends, name,
             )
         if st.get("deferred"):
             # Deferred jobs are pending but unclaimable until their tempfail retry window
