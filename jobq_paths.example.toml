@@ -1,0 +1,11 @@
+# jobq reads a file named jobq_paths.toml to find your queue folder: the folder
+# that holds your queues, the jobs in them, their results and logs, and one
+# policy file per machine. Every machine that runs your jobs must be able to
+# read and write it, so with several machines it lives on a shared filesystem.
+#
+# To use this file: copy it to jobq_paths.toml in your project directory and
+# set the path below. jobq finds the file from any directory inside the
+# project. Keep jobq_paths.toml out of version control (it names a folder that
+# is yours, not the project's) and commit only this example.
+
+queue_folder = "/shared/me/jobq"

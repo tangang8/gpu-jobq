@@ -1,0 +1,40 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "gpu-jobq"
+version = "0.1.0"
+description = "A file-based GPU job queue for one user across several machines."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+authors = [{ name = "Angela Tang" }]
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+]
+dependencies = ["typer", "loguru"]
+
+[project.optional-dependencies]
+dev = ["pytest", "ruff"]
+
+[project.scripts]
+jobq = "jobq.cli:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/jobq"]
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests", "tools"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+# B008: typer declares CLI options as argument defaults, which is its whole API.
+ignore = ["E501", "B008"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
