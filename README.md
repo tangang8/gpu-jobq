@@ -304,6 +304,13 @@ the folder of the project you are in. Each command has `--help`.
 | [Queue folder reference](docs/queue-folder.md) | State files, logs, local locks, and cleanup |
 | [Development](docs/development.md) | Set-up, source map, and the execution path |
 
+## Acknowledgements
+
+The design and the original implementation of this queue are the author's. Much of the
+code, the tests, the trials and the documentation in this repository were written with
+Claude (Anthropic) working under the author's direction; the author reviewed and is
+responsible for all of it.
+
 ## License
 
 [MIT](LICENSE).
