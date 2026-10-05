@@ -7,6 +7,11 @@ per GPU per sample, one row per sample for the processor, and one row per sample
 pool's slot use — so a later ``jobq usage`` can put idle GPUs and finished jobs side by
 side over any window.
 
+Beside each CSV file sits a log of the same name ending in ``.log``, one line per sample
+saying the same thing in words — which GPUs were idle and what the busy ones were doing —
+for a person who wants to ``tail`` a file rather than read columns. The CSV files are what
+``jobq usage`` reads; the logs are read by nothing but people.
+
 The monitor folder is the caller's to name: the commands pass the one the settings file
 gives (``monitor/`` beside ``jobq_paths.toml`` unless ``monitor_folder`` says otherwise,
 see :mod:`jobq.settings`), so the samples sit in the project rather than among the queue
@@ -117,6 +122,11 @@ def slots_csv_path(root: Path, hostname: str, monitor_folder: Path | None = None
     return monitor_dir(root, monitor_folder) / f"slots.{hostname}.csv"
 
 
+def log_path(csv_path: Path) -> Path:
+    """The log written beside one sample file: the same name, ending in ``.log``."""
+    return Path(csv_path).with_suffix(".log")
+
+
 def now_stamp() -> str:
     """The current time as ISO 8601 with the UTC offset, the stamp every row carries."""
     return datetime.now(UTC).isoformat(timespec="seconds")
@@ -153,6 +163,37 @@ def append_row(path: Path, columns: tuple[str, ...], row: dict) -> None:
             if fresh:
                 writer.writeheader()
             writer.writerow({c: row.get(c, "") for c in columns})
+
+
+def append_line(path: Path, line: str) -> None:
+    """Append one line to a log, under the lock its daily trim takes."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with file_lock(sample_lock_path(path)), open(path, "a") as fh:
+        fh.write(line + "\n")
+
+
+def trim_old_lines(path: Path, keep_days: float, *, now: datetime | None = None) -> int:
+    """Drop lines older than ``keep_days`` from one log. Returns the count.
+
+    A line starts with its timestamp; one whose start cannot be read as a time is kept.
+    """
+    if keep_days <= 0 or not Path(path).exists():
+        return 0
+    cutoff = (now or datetime.now(UTC)) - timedelta(days=keep_days)
+    with file_lock(sample_lock_path(path)):
+        try:
+            lines = Path(path).read_text().splitlines()
+        except OSError:
+            return 0
+        kept = []
+        for line in lines:
+            stamp = parse_stamp(line.split(" ", 1)[0])
+            if stamp is None or stamp >= cutoff:
+                kept.append(line)
+        dropped = len(lines) - len(kept)
+        if dropped:
+            atomic_write_text(path, "".join(line + "\n" for line in kept))
+    return dropped
 
 
 def read_rows(path: Path) -> list[dict]:
@@ -451,6 +492,9 @@ class Sampler:
     def _write_gpu_rows(self, timestamp: str) -> None:
         readings = self._gpu_query()
         held = self._occupancy()
+        path = gpu_csv_path(self.root, self.hostname, self.folder)
+        words: list[str] = []
+        idle_gpus = 0
         for g in self.gpus:
             reading = readings.get(g)
             if reading is None:
@@ -459,8 +503,17 @@ class Sampler:
                 reading.util_pct < self.config.idle_util_pct
                 and reading.mem_used_mib < self.config.idle_mem_mib
             )
+            jobs = int(held.get(g, 0))
+            if idle:
+                idle_gpus += 1
+                words.append(f"{g}:idle")
+            else:
+                words.append(
+                    f"{g}:busy({_number_text(reading.util_pct)}%,{reading.mem_used_mib}MiB,"
+                    f"{jobs} of ours)"
+                )
             append_row(
-                gpu_csv_path(self.root, self.hostname, self.folder),
+                path,
                 GPU_COLUMNS,
                 {
                     "timestamp": timestamp,
@@ -470,35 +523,53 @@ class Sampler:
                     "mem_total_mib": reading.mem_total_mib,
                     "power_w": "" if reading.power_w is None else _number_text(reading.power_w),
                     "idle": 1 if idle else 0,
-                    "our_jobs": int(held.get(g, 0)),
+                    "our_jobs": jobs,
                 },
             )
+        if words:
+            line = f"{timestamp} {idle_gpus}/{len(words)} idle | {' '.join(words)}"
+        elif self.gpus:
+            line = f"{timestamp} no reading for any GPU in this machine's policy"
+        else:
+            return  # no GPUs to sample, so nothing to say about them
+        append_line(log_path(path), line)
 
     def _write_cpu_row(self, timestamp: str, util: float) -> None:
         ncpu = usable_cores()
         load = read_loadavg() or (0.0, 0.0, 0.0)
         mem_used, mem_total = read_meminfo() or (0, 0)
+        path = cpu_csv_path(self.root, self.hostname, self.folder)
+        idle = util < self.config.idle_cpu_pct
+        busy_cores = round(util * ncpu / 100.0)
         append_row(
-            cpu_csv_path(self.root, self.hostname, self.folder),
+            path,
             CPU_COLUMNS,
             {
                 "timestamp": timestamp,
                 "ncpu": ncpu,
                 "util_pct": _number_text(util),
-                "busy_cores": round(util * ncpu / 100.0),
+                "busy_cores": busy_cores,
                 "load1": _number_text(load[0]),
                 "load5": _number_text(load[1]),
                 "load15": _number_text(load[2]),
                 "mem_used_mib": mem_used,
                 "mem_total_mib": mem_total,
-                "idle": 1 if util < self.config.idle_cpu_pct else 0,
+                "idle": 1 if idle else 0,
             },
+        )
+        append_line(
+            log_path(path),
+            f"{timestamp} {'idle' if idle else 'busy'} | util {_number_text(util)}% "
+            f"(~{busy_cores}/{ncpu} cores) load "
+            f"{'/'.join(_number_text(value) for value in load)} "
+            f"mem {mem_used}/{mem_total}MiB",
         )
 
     def _write_slots_row(self, timestamp: str) -> None:
         state = self._slot_state()
+        path = slots_csv_path(self.root, self.hostname, self.folder)
         append_row(
-            slots_csv_path(self.root, self.hostname, self.folder),
+            path,
             SLOT_COLUMNS,
             {
                 "timestamp": timestamp,
@@ -511,6 +582,12 @@ class Sampler:
                 "cap_per_gpu": state.cap_per_gpu,
                 "live": 1 if state.live else 0,
             },
+        )
+        append_line(
+            log_path(path),
+            f"{timestamp} {state.used}/{state.slots} slots used, {state.wait} waiting | "
+            f"{state.gpus} gpus, {state.yielded} yielded, cap {state.cap_per_gpu} per gpu | "
+            f"{'pool live' if state.live else 'no pool'}",
         )
 
     def maybe_trim(self, *, now: float | None = None) -> None:
@@ -525,6 +602,7 @@ class Sampler:
             slots_csv_path(self.root, self.hostname, self.folder),
         ):
             trim_old_rows(path, self.config.keep_days)
+            trim_old_lines(log_path(path), self.config.keep_days)
 
     def tick(self) -> None:
         """One pass: sample, trim, and swallow whatever went wrong, logged once per outage."""

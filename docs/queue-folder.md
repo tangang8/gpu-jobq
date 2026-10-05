@@ -180,9 +180,12 @@ file names as `monitor_folder` (see
 ├── jobq_paths.toml
 └── monitor/
     ├── gpu.<hostname>.csv
+    ├── gpu.<hostname>.log
     ├── cpu.<hostname>.csv
+    ├── cpu.<hostname>.log
     ├── slots.<hostname>.csv
-    └── <name>.csv.lock             # one per sample file, appends against the daily trim
+    ├── slots.<hostname>.log
+    └── <name>.lock                 # one per file, appends against the daily trim
 ```
 
 It holds three CSV files per machine, appended by the
@@ -208,6 +211,20 @@ the ratio of two `/proc/stat` readings `monitor_cpu_sample_s` apart,
 jobs hold (`used`), the capacity behind it (`slots`, the policy GPUs less the
 yielded ones times the cap in force), how many claimed jobs wait for capacity
 (`wait`), and `live`, which is `1` for a pool and `0` for `jobq monitor`.
+
+Beside each CSV file is a log of the same name ending in `.log`, with one line
+per sample saying the same thing in words, for reading with `tail`:
+
+```text
+gpu.<hostname>.log    2026-10-03T02:41:54+00:00 6/8 idle | 0:idle 1:idle 2:idle 3:idle 4:idle 5:idle 6:busy(75%,30719MiB,1 of ours) 7:busy(97%,30719MiB,1 of ours)
+cpu.<hostname>.log    2026-10-03T02:41:54+00:00 busy | util 36.9% (~18/48 cores) load 19.4/20.1/21.7 mem 159002/740466MiB
+slots.<hostname>.log  2026-10-03T02:41:54+00:00 8/40 slots used, 0 waiting | 8 gpus, 0 yielded, cap 5 per gpu | pool live
+```
+
+A busy GPU's entry gives its utilisation, its memory in use and how many of
+this queue folder's jobs hold a slot on it. The logs are trimmed with the CSV
+files, by `monitor_keep_days`. `jobq usage` and `jobq status` read the CSV
+files only.
 
 ## Files inside a queue
 

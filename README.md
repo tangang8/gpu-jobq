@@ -247,7 +247,8 @@ the [policy reference](docs/policy.md) lists every key.
 A running pool samples its machine every five minutes — each GPU's
 utilisation and memory, the processor, and the slots the pool holds — and
 appends the readings to `monitor/` in your project directory, beside
-`jobq_paths.toml`, as plain CSV files you can open directly. It is on by
+`jobq_paths.toml`: CSV files, and a `.log` beside each with one readable line
+per sample (`tail -f monitor/gpu.<hostname>.log`). It is on by
 default; `jobq work --no-monitor` turns it off for one run. `jobq usage --since
 7d` reads what every machine wrote and prints one table of GPUs, processor and
 slots, with the jobs each machine finished per hour beneath it. A machine that

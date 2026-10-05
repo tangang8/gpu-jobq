@@ -436,8 +436,9 @@ While a pool runs it samples this machine every `monitor_interval_s` seconds —
 each GPU's utilisation and memory, the processor, and how many slots the pool
 holds — and appends the readings to the monitor folder: `monitor/` beside
 `jobq_paths.toml`, in the project you run jobq from, unless `monitor_folder` in
-that file names another place. The files are plain CSV, so they can be opened,
-plotted or tailed directly. It is on by default; `jobq work --no-monitor` turns
+that file names another place. Each machine gets three CSV files, for plotting
+or loading, and a `.log` beside each with one readable line per sample, so
+`tail -f monitor/gpu.<hostname>.log` shows which GPUs are idle as it happens. It is on by default; `jobq work --no-monitor` turns
 it off for one run, and `monitor_interval_s: 0` in the policy turns it off on
 that machine.
 
