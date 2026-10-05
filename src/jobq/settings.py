@@ -7,11 +7,7 @@ current directory or in a directory above it, and uses the nearest such file. Th
 the only thing that names the folder, so a command run anywhere inside a project acts on
 the folder the project names.
 
-A second, optional key, ``monitor_folder``, names where the utilisation samples go. Left
-out, they go into ``monitor/`` beside the settings file — in the project, next to the code
-that submits the jobs, where the person running them looks first.
-
-Other keys are ignored, which leaves room for later settings without breaking an older
+Unknown keys are ignored, which leaves room for later settings without breaking an older
 copy of jobq. A file that cannot be parsed is an error naming the file: silently acting on
 a different queue folder than the file asks for is worse than refusing to act.
 """
@@ -23,8 +19,6 @@ from pathlib import Path
 
 FILE_NAME = "jobq_paths.toml"
 QUEUE_FOLDER_KEY = "queue_folder"
-MONITOR_FOLDER_KEY = "monitor_folder"
-DEFAULT_MONITOR_FOLDER = "monitor"
 
 
 class SettingsError(Exception):
@@ -61,29 +55,13 @@ def queue_folder_in_file(path: Path) -> Path | None:
     name a folder beside itself and stay correct whatever directory inside the project a
     command is run from. A leading ``~`` is expanded.
     """
-    return _folder_in_file(path, QUEUE_FOLDER_KEY, "the queue folder")
-
-
-def monitor_folder_in_file(path: Path) -> Path:
-    """The folder the utilisation samples of a settings file's project go into.
-
-    ``monitor_folder`` names it, read as ``queue_folder`` is. Left out, it is ``monitor/``
-    in the directory of the settings file, so the samples sit in the project itself.
-    """
-    folder = _folder_in_file(path, MONITOR_FOLDER_KEY, "the folder for utilisation samples")
-    if folder is None:
-        return Path(path).resolve().parent / DEFAULT_MONITOR_FOLDER
-    return folder
-
-
-def _folder_in_file(path: Path, key: str, what: str) -> Path | None:
-    """The folder one key of a settings file names, or ``None`` when the key is absent."""
-    value = read_settings(path).get(key)
+    value = read_settings(path).get(QUEUE_FOLDER_KEY)
     if value is None:
         return None
     if not isinstance(value, str) or not value:
         raise SettingsError(
-            f"the settings file {path} sets {key} to {value!r}; it takes {what} as a string"
+            f"the settings file {path} sets {QUEUE_FOLDER_KEY} to {value!r}; it takes the "
+            "queue folder as a string"
         )
     folder = Path(value).expanduser()
     if not folder.is_absolute():

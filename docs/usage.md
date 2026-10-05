@@ -22,25 +22,13 @@ directory of the file that holds it, and a leading `~` is expanded; an absolute
 path is clearest. With no such file, a command that needs the folder says so
 and how to write one.
 
-The same file may name where the utilisation samples go:
-
-```toml
-# Optional. Left out, the samples go into monitor/ beside this file.
-monitor_folder = "/shared/me/jobq-monitor"
-```
-
-Left out, they go into `monitor/` in the directory of the file, which is the
-project itself. `monitor_folder` is read as `queue_folder` is: a relative path
-is taken from the directory of the file, and a leading `~` is expanded.
-
-`jobq config` prints the file in use, the queue folder it names and the folder
-the samples go into, and writes nothing; `jobq config --json` prints the same
-three paths as a JSON object for scripts.
+`jobq config` prints the file in use and the folder it names, and writes
+nothing; `jobq config --json` prints the same two paths as a JSON object for
+scripts.
 
 The queue folder belongs to you rather than to the project, so a project that
 keeps a `jobq_paths.toml` usually adds that file to its `.gitignore` and tells
-its readers to write their own. The `monitor/` directory beside it holds this
-machine's readings and belongs in the `.gitignore` too.
+its readers to write their own.
 
 ## Set up this machine
 
@@ -434,19 +422,17 @@ from any machine at any time.
 
 While a pool runs it samples this machine every `monitor_interval_s` seconds —
 each GPU's utilisation and memory, the processor, and how many slots the pool
-holds — and appends the readings to the monitor folder: `monitor/` beside
-`jobq_paths.toml`, in the project you run jobq from, unless `monitor_folder` in
-that file names another place. Each machine gets three CSV files, for plotting
-or loading, and a `.log` beside each with one readable line per sample, so
-`tail -f monitor/gpu.<hostname>.log` shows which GPUs are idle as it happens. It is on by default; `jobq work --no-monitor` turns
-it off for one run, and `monitor_interval_s: 0` in the policy turns it off on
-that machine.
+holds — and appends the readings to `monitor/` in the queue folder. Each
+machine gets three CSV files, for plotting or loading, and a `.log` beside each
+with one readable line per sample, so `tail -f monitor/gpu.<hostname>.log`
+there shows which GPUs are idle as it happens, and `monitor/fleet_slots.log`
+has one line per sample with the slots of every machine side by side. It is on
+by default;
+`jobq work --no-monitor` turns it off for one run, and
+`monitor_interval_s: 0` in the policy turns it off on that machine.
 
 `jobq usage` reads the sample files of every machine that has a policy file and
-prints one table. It reads them from the monitor folder of the project it is
-run in, so it sees another machine's samples only where both machines write to
-the same folder: either the project directory is on a filesystem they share, or
-`monitor_folder` on each machine names a shared folder.
+prints one table:
 
 ```text
 machine     gpu  util  idle  none of yours  mem used  cpu  slots     last sample

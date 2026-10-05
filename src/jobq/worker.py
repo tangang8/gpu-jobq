@@ -2507,7 +2507,6 @@ def run_pool(
     lock_prefix: str | None = None,  # resolved via gpu.resolve_lock_prefix when absent
     supervise_s: float = gpu_defaults.DEFAULT_SUPERVISE_S,
     monitor_samples: bool = True,
-    monitor_folder: Path | None = None,
 ) -> None:
     """Drain this machine's share of the queue folder until it is complete or stopped.
 
@@ -2529,9 +2528,8 @@ def run_pool(
             queue root — see ``gpu.resolve_lock_prefix``).
         supervise_s: Supervisor tick: respawn dead threads, re-read the scale file, run the
             janitors.
-        monitor_samples: Append utilisation samples while the pool runs (see
-            :mod:`jobq.monitor`). False turns sampling off for this pool.
-        monitor_folder: Where those samples go; left out, ``monitor/`` in the queue folder.
+        monitor_samples: Append utilisation samples to the queue folder while the pool
+            runs (see :mod:`jobq.monitor`). False turns sampling off for this pool.
     """
     root = Path(root)
     hostname = hostname or store.this_host()
@@ -2551,7 +2549,6 @@ def run_pool(
             lock_prefix=lock_prefix,
             supervise_s=supervise_s,
             monitor_samples=monitor_samples,
-            monitor_folder=monitor_folder,
         )
     finally:
         os.close(lock_fd)  # the lock file itself stays: a pool may be waiting on it
@@ -2569,7 +2566,6 @@ def _run_pool_locked(
     lock_prefix: str | None,
     supervise_s: float,
     monitor_samples: bool = True,
-    monitor_folder: Path | None = None,
 ) -> None:
     """Run the pool with this machine's pool lock already held (see :func:`run_pool`)."""
     # Opt-in world-writable queue state, for an account whose uid differs between the machines
@@ -2609,7 +2605,6 @@ def _run_pool_locked(
                 lock_prefix=lock_prefix,
                 supervise_s=supervise_s,
                 monitor_samples=monitor_samples,
-                monitor_folder=monitor_folder,
             )
         finally:
             # Whatever happened — an unusable MPS daemon, a queue folder that cannot be
@@ -2637,7 +2632,6 @@ def _run_pool_started(
     lock_prefix: str | None,
     supervise_s: float,
     monitor_samples: bool,
-    monitor_folder: Path | None = None,
 ) -> None:
     """The pool's own life, with the lock held, the handlers installed and a pid file."""
     _policy = policy
@@ -2737,13 +2731,7 @@ def _run_pool_started(
         )
         watch_thread.start()
     monitor_thread = _start_sampler(
-        root,
-        hostname,
-        gpu,
-        pool,
-        stop_event,
-        enabled=monitor_samples,
-        monitor_folder=monitor_folder,
+        root, hostname, gpu, pool, stop_event, enabled=monitor_samples
     )
     with _shutdown_watch(pool, master, root, hostname):
         supervisor_error = _supervise_workers(
@@ -2869,7 +2857,6 @@ def _start_sampler(
     stop_event: threading.Event,
     *,
     enabled: bool,
-    monitor_folder: Path | None = None,
 ) -> threading.Thread | None:
     """Start the utilisation sampler on its own thread, or return ``None`` when it is off.
 
@@ -2893,7 +2880,6 @@ def _start_sampler(
         gpus=tuple(policy.gpus) if policy is not None else (),
         occupancy=_occupancy_of(gpu),
         slot_state=lambda: pool_slot_state(root, hostname, gpu, pool),
-        monitor_folder=monitor_folder,
     )
     thread = threading.Thread(
         target=sampler.run, args=(stop_event,), name="jobq-monitor", daemon=True

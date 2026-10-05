@@ -1,21 +1,21 @@
-"""Utilisation sampling: GPU, CPU and slot rows written into the monitor folder.
+"""Utilisation sampling: GPU, CPU and slot rows written into the queue folder.
 
 A pool knows what its own jobs are doing, but not what the machine as a whole was doing
 while they ran, and nothing in the queue folder says whether a machine sat idle for a day.
-This module writes three plain CSV files per machine into the monitor folder — one row
-per GPU per sample, one row per sample for the processor, and one row per sample for the
-pool's slot use — so a later ``jobq usage`` can put idle GPUs and finished jobs side by
-side over any window.
+This module writes three plain CSV files per machine under ``<queue folder>/monitor/`` —
+one row per GPU per sample, one row per sample for the processor, and one row per sample
+for the pool's slot use — so a later ``jobq usage`` can put idle GPUs and finished jobs
+side by side over any window.
 
 Beside each CSV file sits a log of the same name ending in ``.log``, one line per sample
 saying the same thing in words — which GPUs were idle and what the busy ones were doing —
 for a person who wants to ``tail`` a file rather than read columns. The CSV files are what
 ``jobq usage`` reads; the logs are read by nothing but people.
 
-The monitor folder is the caller's to name: the commands pass the one the settings file
-gives (``monitor/`` beside ``jobq_paths.toml`` unless ``monitor_folder`` says otherwise,
-see :mod:`jobq.settings`), so the samples sit in the project rather than among the queue
-state. A caller that names none gets ``monitor/`` in the queue folder.
+One more log, ``fleet_slots.log``, has one line per sample for every machine with a policy
+file at once: the slots each live pool holds against its capacity, and which machines have
+no pool running. Every sampler offers a line and the first to arrive in an interval writes
+it, so the log has one line per interval however many machines sample.
 
 The readings themselves come from ``nvidia-smi`` and from ``/proc``, both behind small
 functions a caller can replace: :func:`query_gpu_samples` takes the GPU readings, and the
@@ -27,13 +27,14 @@ Rows are appended, never rewritten, and a row older than the keep window is drop
 day, header kept. Each file has a lock file of its own beside it, so an append and the
 daily trim of the same file cannot overlap. Every file is readable by anything that reads CSV, which is the point of
 the format: the machine that samples and the machine that reads need share nothing but the
-monitor folder.
+queue folder.
 """
 
 from __future__ import annotations
 
 import csv
 import io
+import json
 import os
 import re
 import subprocess
@@ -100,26 +101,26 @@ SLOT_COLUMNS = (
 TRIM_INTERVAL_S = 86400.0
 
 
-def monitor_dir(root: Path, monitor_folder: Path | None = None) -> Path:
-    """The directory holding the sample files of every machine.
-
-    ``monitor_folder`` when the caller names one, otherwise ``monitor/`` in the queue folder.
-    """
-    if monitor_folder is not None:
-        return Path(monitor_folder)
+def monitor_dir(root: Path) -> Path:
+    """The directory holding the sample files of every machine."""
     return Path(root) / "monitor"
 
 
-def gpu_csv_path(root: Path, hostname: str, monitor_folder: Path | None = None) -> Path:
-    return monitor_dir(root, monitor_folder) / f"gpu.{hostname}.csv"
+def gpu_csv_path(root: Path, hostname: str) -> Path:
+    return monitor_dir(root) / f"gpu.{hostname}.csv"
 
 
-def cpu_csv_path(root: Path, hostname: str, monitor_folder: Path | None = None) -> Path:
-    return monitor_dir(root, monitor_folder) / f"cpu.{hostname}.csv"
+def cpu_csv_path(root: Path, hostname: str) -> Path:
+    return monitor_dir(root) / f"cpu.{hostname}.csv"
 
 
-def slots_csv_path(root: Path, hostname: str, monitor_folder: Path | None = None) -> Path:
-    return monitor_dir(root, monitor_folder) / f"slots.{hostname}.csv"
+def slots_csv_path(root: Path, hostname: str) -> Path:
+    return monitor_dir(root) / f"slots.{hostname}.csv"
+
+
+def fleet_log_path(root: Path) -> Path:
+    """The one log every machine's sampler writes: the slots of all of them, a line a sample."""
+    return monitor_dir(root) / "fleet_slots.log"
 
 
 def log_path(csv_path: Path) -> Path:
@@ -447,10 +448,8 @@ class Sampler:
         occupancy=None,
         slot_state=None,
         sleep=None,
-        monitor_folder: Path | None = None,
     ) -> None:
         self.root = Path(root)
-        self.folder = monitor_dir(self.root, monitor_folder)
         self.hostname = hostname
         self.config = config or MonitorConfig()
         self.gpus = tuple(gpus)
@@ -488,11 +487,12 @@ class Sampler:
         else:
             self._write_cpu_row(timestamp, util)
         self._write_slots_row(timestamp)
+        append_fleet_line(self.root, timestamp, interval_s=self.config.interval_s)
 
     def _write_gpu_rows(self, timestamp: str) -> None:
         readings = self._gpu_query()
         held = self._occupancy()
-        path = gpu_csv_path(self.root, self.hostname, self.folder)
+        path = gpu_csv_path(self.root, self.hostname)
         words: list[str] = []
         idle_gpus = 0
         for g in self.gpus:
@@ -538,7 +538,7 @@ class Sampler:
         ncpu = usable_cores()
         load = read_loadavg() or (0.0, 0.0, 0.0)
         mem_used, mem_total = read_meminfo() or (0, 0)
-        path = cpu_csv_path(self.root, self.hostname, self.folder)
+        path = cpu_csv_path(self.root, self.hostname)
         idle = util < self.config.idle_cpu_pct
         busy_cores = round(util * ncpu / 100.0)
         append_row(
@@ -567,7 +567,7 @@ class Sampler:
 
     def _write_slots_row(self, timestamp: str) -> None:
         state = self._slot_state()
-        path = slots_csv_path(self.root, self.hostname, self.folder)
+        path = slots_csv_path(self.root, self.hostname)
         append_row(
             path,
             SLOT_COLUMNS,
@@ -597,12 +597,13 @@ class Sampler:
             return
         self._next_trim = clock + TRIM_INTERVAL_S
         for path in (
-            gpu_csv_path(self.root, self.hostname, self.folder),
-            cpu_csv_path(self.root, self.hostname, self.folder),
-            slots_csv_path(self.root, self.hostname, self.folder),
+            gpu_csv_path(self.root, self.hostname),
+            cpu_csv_path(self.root, self.hostname),
+            slots_csv_path(self.root, self.hostname),
         ):
             trim_old_rows(path, self.config.keep_days)
             trim_old_lines(log_path(path), self.config.keep_days)
+        trim_old_lines(fleet_log_path(self.root), self.config.keep_days)
 
     def tick(self) -> None:
         """One pass: sample, trim, and swallow whatever went wrong, logged once per outage."""
@@ -626,6 +627,98 @@ class Sampler:
             self.tick()
             if stop.wait(self.config.interval_s):
                 return
+
+
+# --------------------------- the fleet log ---------------------------
+
+# A machine's latest slots row speaks for it while it is no older than this many of the
+# sampling intervals; past that the machine's pool is alive but is not sampling.
+FLEET_ROW_FRESH_INTERVALS = 3.0
+# A second sampler arriving within this share of an interval of the last fleet line adds
+# nothing: the line it would write describes the same moment.
+FLEET_LINE_MIN_GAP = 0.5
+
+
+def _heartbeat_stale_s(root: Path, hostname: str) -> float:
+    """How old a machine's heartbeat may be, from its policy file, or the default."""
+    try:
+        raw = json.loads((Path(root) / f"gpu_policy.{hostname}.json").read_text())
+        value = float(raw.get("heartbeat_stale_s", DEFAULT_HEARTBEAT_STALE_S))
+    except (OSError, ValueError, TypeError, AttributeError):
+        return DEFAULT_HEARTBEAT_STALE_S
+    return value if value > 0 else DEFAULT_HEARTBEAT_STALE_S
+
+
+def _int_or_zero(row: dict, key: str) -> int:
+    try:
+        return int(float(row.get(key, "")))
+    except (TypeError, ValueError):
+        return 0
+
+
+def fleet_cell(
+    root: Path, hostname: str, *, now: datetime, fresh_s: float
+) -> tuple[str, int, int]:
+    """One machine's part of a fleet line, and the used and total slots it adds to the sum.
+
+    A machine whose pool has no fresh heartbeat is down and offers no slots. One whose
+    pool is alive is described by the last slots row it wrote, when that row is recent.
+    """
+    if not store.heartbeat_state(root, hostname, _heartbeat_stale_s(root, hostname))["fresh"]:
+        return f"{hostname} 0/0 (down)", 0, 0
+    row = latest_slots_row(root, hostname)
+    stamp = parse_stamp(row.get("timestamp")) if row else None
+    if row is None or stamp is None or (now - stamp).total_seconds() > fresh_s:
+        return f"{hostname} ?/? (no samples)", 0, 0
+    used, slots = _int_or_zero(row, "used"), _int_or_zero(row, "slots")
+    cell = f"{hostname} {used}/{slots}"
+    yielded, wait = _int_or_zero(row, "yielded"), _int_or_zero(row, "wait")
+    if yielded:
+        cell += f" ({yielded} yielded)"
+    if wait:
+        cell += f" +{wait}w"
+    return cell, used, slots
+
+
+def fleet_line(root: Path, timestamp: str, *, interval_s: float) -> str | None:
+    """The fleet line for one moment, or ``None`` when no machine has a policy file."""
+    hosts = machines_with_a_policy(root)
+    if not hosts:
+        return None
+    now = parse_stamp(timestamp) or datetime.now(UTC)
+    fresh_s = max(interval_s, 1.0) * FLEET_ROW_FRESH_INTERVALS
+    cells, total_used, total_slots = [], 0, 0
+    for host in hosts:
+        cell, used, slots = fleet_cell(root, host, now=now, fresh_s=fresh_s)
+        cells.append(cell)
+        total_used += used
+        total_slots += slots
+    return f"{timestamp} {total_used}/{total_slots} | {' | '.join(cells)}"
+
+
+def append_fleet_line(root: Path, timestamp: str, *, interval_s: float) -> bool:
+    """Append this moment's fleet line unless another sampler just wrote one. True if written.
+
+    Every machine's sampler calls this each round. The check and the append happen under
+    the log's lock, so of the samplers arriving together exactly one writes.
+    """
+    line = fleet_line(root, timestamp, interval_s=interval_s)
+    if line is None:
+        return False
+    path = fleet_log_path(root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    now = parse_stamp(timestamp) or datetime.now(UTC)
+    with file_lock(sample_lock_path(path)):
+        try:
+            lines = path.read_text().splitlines()
+        except OSError:
+            lines = []
+        last = parse_stamp(lines[-1].split(" ", 1)[0]) if lines else None
+        if last is not None and (now - last).total_seconds() < interval_s * FLEET_LINE_MIN_GAP:
+            return False
+        with open(path, "a") as fh:
+            fh.write(line + "\n")
+    return True
 
 
 def _number_text(value: float) -> str:
@@ -769,13 +862,12 @@ def machine_usage(
     window_s: float | None,
     jobs_done: int,
     now: datetime | None = None,
-    monitor_folder: Path | None = None,
 ) -> MachineUsage:
     """One machine's row of the usage table, over the window."""
     moment = now or datetime.now(UTC)
-    gpu_rows = _within(read_rows(gpu_csv_path(root, hostname, monitor_folder)), cutoff)
-    cpu_rows = _within(read_rows(cpu_csv_path(root, hostname, monitor_folder)), cutoff)
-    slot_rows = _within(read_rows(slots_csv_path(root, hostname, monitor_folder)), cutoff)
+    gpu_rows = _within(read_rows(gpu_csv_path(root, hostname)), cutoff)
+    cpu_rows = _within(read_rows(cpu_csv_path(root, hostname)), cutoff)
+    slot_rows = _within(read_rows(slots_csv_path(root, hostname)), cutoff)
     per_gpu: dict[int, list[dict]] = {}
     for row in gpu_rows:
         try:
@@ -813,11 +905,7 @@ def machine_usage(
 
 
 def usage_report(
-    root: Path,
-    *,
-    window_s: float | None = None,
-    now: datetime | None = None,
-    monitor_folder: Path | None = None,
+    root: Path, *, window_s: float | None = None, now: datetime | None = None
 ) -> list[MachineUsage]:
     """The usage of every machine that has a policy file, over the window."""
     moment = now or datetime.now(UTC)
@@ -831,29 +919,20 @@ def usage_report(
             window_s=window_s,
             jobs_done=finished.get(host, 0),
             now=moment,
-            monitor_folder=monitor_folder,
         )
         for host in machines_with_a_policy(root)
     ]
 
 
 def recent_gpu_summary(
-    root: Path,
-    hostname: str,
-    *,
-    window_s: float,
-    now: datetime | None = None,
-    monitor_folder: Path | None = None,
+    root: Path, hostname: str, *, window_s: float, now: datetime | None = None
 ) -> tuple[float | None, int, int]:
     """Mean utilisation, idle GPUs and GPUs seen, over the last ``window_s`` of samples.
 
     A GPU counts as idle when its most recent sample in the window says so.
     """
     moment = now or datetime.now(UTC)
-    rows = _within(
-        read_rows(gpu_csv_path(root, hostname, monitor_folder)),
-        moment - timedelta(seconds=window_s),
-    )
+    rows = _within(read_rows(gpu_csv_path(root, hostname)), moment - timedelta(seconds=window_s))
     latest: dict[int, dict] = {}
     for row in rows:
         try:
@@ -955,9 +1034,7 @@ def render_jobs_per_hour(report: list[MachineUsage], window_text: str | None) ->
     return lines
 
 
-def latest_slots_row(
-    root: Path, hostname: str, monitor_folder: Path | None = None
-) -> dict | None:
+def latest_slots_row(root: Path, hostname: str) -> dict | None:
     """The last slots row this machine wrote, or ``None`` when it has written none."""
-    rows = read_rows(slots_csv_path(root, hostname, monitor_folder))
+    rows = read_rows(slots_csv_path(root, hostname))
     return rows[-1] if rows else None

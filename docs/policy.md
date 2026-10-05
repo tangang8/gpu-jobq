@@ -295,8 +295,7 @@ existing file's permissions or bypass inaccessible parent directories.
 | `heartbeat_stale_s` | `180` | How old a machine's heartbeat may be before `jobq status` says it has not been heard from. Above `0`. |
 
 The pool samples while it runs, on a thread of its own, and writes the rows
-into `monitor/` beside `jobq_paths.toml`, or into the `monitor_folder` that
-file names; `jobq work --no-monitor` turns sampling
+into `monitor/` in the queue folder; `jobq work --no-monitor` turns sampling
 off for one run without editing the policy. A machine that should be watched
 without running jobs runs `jobq monitor`. See
 [the sample files](queue-folder.md#monitoring-files) and

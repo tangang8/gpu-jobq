@@ -18,6 +18,15 @@ Capacity locks live separately on each worker machine.
 ├── workers.<hostname>              # optional live worker-count target
 ├── yielded.<hostname>.json
 ├── .submit.lock                    # serializes submissions and settings changes
+├── monitor/
+│   ├── gpu.<hostname>.csv
+│   ├── gpu.<hostname>.log
+│   ├── cpu.<hostname>.csv
+│   ├── cpu.<hostname>.log
+│   ├── slots.<hostname>.csv
+│   ├── slots.<hostname>.log
+│   ├── fleet_slots.log             # one line per sample for all machines together
+│   └── <name>.lock                 # one per file, appends against the daily trim
 ├── logs/
 │   └── <stamp>_worker.<hostname>.log
 └── <queue>/
@@ -170,25 +179,7 @@ information: a machine's claims are still recovered by that machine's own pool.
 
 ## Monitoring files
 
-The utilisation samples are not in the queue folder. They are in the monitor
-folder: `monitor/` in the directory of `jobq_paths.toml`, or the folder that
-file names as `monitor_folder` (see
-[where the queue folder comes from](usage.md#where-the-queue-folder-comes-from)).
-
-```text
-<project>/
-├── jobq_paths.toml
-└── monitor/
-    ├── gpu.<hostname>.csv
-    ├── gpu.<hostname>.log
-    ├── cpu.<hostname>.csv
-    ├── cpu.<hostname>.log
-    ├── slots.<hostname>.csv
-    ├── slots.<hostname>.log
-    └── <name>.lock                 # one per file, appends against the daily trim
-```
-
-It holds three CSV files per machine, appended by the
+The `monitor/` directory holds three CSV files per machine, appended by the
 pool (or by `jobq monitor` on a machine that runs no pool) every
 `monitor_interval_s` seconds. Each file starts with a header row and is only
 ever appended to; rows older than `monitor_keep_days` are dropped once a day,
@@ -225,6 +216,23 @@ A busy GPU's entry gives its utilisation, its memory in use and how many of
 this queue folder's jobs hold a slot on it. The logs are trimmed with the CSV
 files, by `monitor_keep_days`. `jobq usage` and `jobq status` read the CSV
 files only.
+
+`fleet_slots.log` is the one file all machines share. Each line gives the slots
+in use against the slots on offer across every machine with a policy file, and
+then each machine's own figures:
+
+```text
+2026-10-03T02:41:54+00:00 13/80 | gpu-host-1 8/40 | gpu-host-2 5/40 (1 yielded) +2w | gpu-host-3 0/0 (down)
+```
+
+A machine is `(down)`, and offers no slots, when its pool's heartbeat is older
+than its `heartbeat_stale_s`, which is the test `jobq status` applies. A machine
+whose pool is alive is described by the last slots row it wrote: `(N yielded)`
+counts its yielded GPUs and `+Nw` its claimed jobs waiting for capacity. A live
+pool with no slots row in the last three sampling intervals, such as one started
+with `--no-monitor`, shows as `?/? (no samples)` and is left out of the sum.
+Every sampler offers a line each round and the first one in an interval writes
+it, so the log has one line per interval however many machines sample.
 
 ## Files inside a queue
 

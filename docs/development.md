@@ -27,7 +27,7 @@ ruff check .
 | Module | Responsibility |
 | --- | --- |
 | [`cli.py`](../src/jobq/cli.py) | Typer commands, submission options, status formatting, operator actions |
-| [`settings.py`](../src/jobq/settings.py) | The `jobq_paths.toml` file naming the queue folder and the monitor folder, and its search |
+| [`settings.py`](../src/jobq/settings.py) | The `jobq_paths.toml` file naming the queue folder, and its search |
 | [`model.py`](../src/jobq/model.py) | `Job`, jobkey conversion, JSONL and template expansion |
 | [`store.py`](../src/jobq/store.py) | Queue metadata, claims, results, attempts, pauses, completion checks |
 | [`io.py`](../src/jobq/io.py) | Atomic replacement writes, `flock`, shared-permission mode |

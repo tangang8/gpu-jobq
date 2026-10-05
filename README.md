@@ -57,8 +57,7 @@ queue_folder = "/shared/me/jobq"
 Use a path on a shared filesystem for several machines, or a local path for
 one. Add `jobq_paths.toml` to the project's `.gitignore`, since the folder is
 yours rather than the project's. `jobq config` prints the file in use and the
-folder it names. Utilisation samples go into `monitor/` beside that file, so
-add `monitor/` to the `.gitignore` as well.
+folder it names.
 
 **2. Initialize this machine:**
 
@@ -246,16 +245,16 @@ the [policy reference](docs/policy.md) lists every key.
 
 A running pool samples its machine every five minutes — each GPU's
 utilisation and memory, the processor, and the slots the pool holds — and
-appends the readings to `monitor/` in your project directory, beside
-`jobq_paths.toml`: CSV files, and a `.log` beside each with one readable line
-per sample (`tail -f monitor/gpu.<hostname>.log`). It is on by
-default; `jobq work --no-monitor` turns it off for one run. `jobq usage --since
-7d` reads what every machine wrote and prints one table of GPUs, processor and
-slots, with the jobs each machine finished per hour beneath it. A machine that
-should be watched without running jobs runs `jobq monitor`, which samples the
-same way in the foreground. Where the machines do not share the project
-directory, set `monitor_folder` in `jobq_paths.toml` to a folder they do share,
-so that `jobq usage` on one machine sees the samples of the others.
+appends the readings to `monitor/` in the queue folder: CSV files, and a `.log`
+beside each with one readable line per sample
+(`tail -f monitor/gpu.<hostname>.log`), plus `fleet_slots.log` with the slots
+of all machines on one line per sample. It is on by default;
+`jobq work --no-monitor` turns it off for one run. Every machine writes into
+the same folder, so `jobq usage --since 7d` reads what each machine with a
+policy file wrote and prints one table of GPUs, processor and slots, with the
+jobs each machine finished per hour beneath it. A machine that should be
+watched without running jobs runs `jobq monitor`, which samples the same way in
+the foreground.
 
 ## Everyday commands
 
