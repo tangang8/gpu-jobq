@@ -120,6 +120,21 @@ def resolve_root() -> Path:
     return found[0]
 
 
+def resolve_monitor_folder() -> Path:
+    """The folder the utilisation samples go into, from the settings file; otherwise exit.
+
+    ``monitor/`` beside the settings file unless the file names another, so the samples
+    are in the project a person works in rather than among the queue state.
+    """
+    found = queue_folder_source()
+    if found is None:
+        raise fail("{}", no_queue_folder_message())
+    try:
+        return settings.monitor_folder_in_file(found[1])
+    except settings.SettingsError as exc:
+        raise fail("{}", exc) from exc
+
+
 def check_queue_name(name: str) -> str:
     """Return the queue name, or end the command with one sentence naming it.
 
@@ -249,7 +264,7 @@ def config(
         help="Print the folder and the settings file as a JSON object, for scripts.",
     ),
 ) -> None:
-    """Print the settings file in use and the queue folder it names.
+    """Print the settings file in use, the queue folder it names and the monitor folder.
 
     It only reads: the queue folder is set by writing the file, and nothing on the command
     line changes it, so every command in a directory acts on the same folder.
@@ -259,10 +274,21 @@ def config(
     if found is None:
         raise fail("{}", no_queue_folder_message())
     folder, path = found
+    monitor_folder = resolve_monitor_folder()
     if as_json:
-        out("{}", json.dumps({"queue_folder": str(folder), "settings_file": str(path)}))
+        out(
+            "{}",
+            json.dumps(
+                {
+                    "queue_folder": str(folder),
+                    "settings_file": str(path),
+                    "monitor_folder": str(monitor_folder),
+                }
+            ),
+        )
         return
     out("The queue folder is {}, from {}", folder, path)
+    out("Utilisation samples go into {}", monitor_folder)
 
 
 @app.command()
@@ -692,7 +718,7 @@ def work(
     no_monitor: bool = typer.Option(
         False,
         "--no-monitor",
-        help="Do not append utilisation samples to the queue folder while this pool runs.",
+        help="Do not append utilisation samples to the monitor folder while this pool runs.",
     ),
 ) -> None:
     """Run the foreground worker pool on this machine (keep it in a terminal that stays open)."""
@@ -739,6 +765,7 @@ def work(
             queues=q,
             lock_prefix=lock_prefix,
             monitor_samples=not no_monitor,
+            monitor_folder=resolve_monitor_folder(),
         )
     except PolicyError as exc:
         # The pool reads this machine's policy before it starts anything; an unusable one
@@ -1018,15 +1045,16 @@ def _pool_heartbeat_text(root: Path, host: str) -> str:
 def _machine_line(root: Path, host: str) -> str:
     """One machine's line of the status report: its pool, and what its samples say."""
     line = f"machine {host}: {_pool_heartbeat_text(root, host)}"
+    monitor_folder = resolve_monitor_folder()
     util, idle, n_gpus = monitor_mod.recent_gpu_summary(
-        root, host, window_s=MACHINE_SAMPLE_WINDOW_S
+        root, host, window_s=MACHINE_SAMPLE_WINDOW_S, monitor_folder=monitor_folder
     )
     if n_gpus:
         line += (
             f"; last 10 minutes {util:.0f}% utilisation over {n_gpus} gpu(s), "
             f"{idle} idle"
         )
-    latest = monitor_mod.latest_slots_row(root, host)
+    latest = monitor_mod.latest_slots_row(root, host, monitor_folder)
     if latest:
         line += f"; slots {latest.get('used', '?')} of {latest.get('slots', '?')}"
     return line
@@ -1275,7 +1303,9 @@ def usage(
     except SinceError as exc:
         raise fail("{}", exc) from exc
     root = resolve_root()
-    report = monitor_mod.usage_report(root, window_s=window_s)
+    report = monitor_mod.usage_report(
+        root, window_s=window_s, monitor_folder=resolve_monitor_folder()
+    )
     if as_json:
         print(json.dumps(
             {
@@ -1322,6 +1352,7 @@ def monitor(
         logger.info("sampling without a policy on this machine ({}): {}", host, exc)
         policy = None
     config = monitor_mod.config_from_policy(policy)
+    monitor_folder = resolve_monitor_folder()
     sampler = monitor_mod.Sampler(
         root,
         host,
@@ -1329,6 +1360,7 @@ def monitor(
         gpus=tuple(policy.gpus) if policy is not None else (),
         occupancy=lambda: GpuManager(root, host).occupancy() if policy is not None else {},
         slot_state=lambda: _watching_slot_state(root, host, policy),
+        monitor_folder=monitor_folder,
     )
     if once:
         sampler.tick()
@@ -1340,7 +1372,7 @@ def monitor(
         )
     logger.info(
         "sampling {} every {:.0f}s into {}; stop it with Ctrl-C",
-        host, config.interval_s, monitor_mod.monitor_dir(root),
+        host, config.interval_s, monitor_folder,
     )
     stop = threading.Event()
     try:

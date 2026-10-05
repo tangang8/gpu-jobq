@@ -18,11 +18,6 @@ Capacity locks live separately on each worker machine.
 ├── workers.<hostname>              # optional live worker-count target
 ├── yielded.<hostname>.json
 ├── .submit.lock                    # serializes submissions and settings changes
-├── monitor/
-│   ├── gpu.<hostname>.csv
-│   ├── cpu.<hostname>.csv
-│   ├── slots.<hostname>.csv
-│   └── <name>.csv.lock             # one per sample file, appends against the daily trim
 ├── logs/
 │   └── <stamp>_worker.<hostname>.log
 └── <queue>/
@@ -175,7 +170,22 @@ information: a machine's claims are still recovered by that machine's own pool.
 
 ## Monitoring files
 
-The `monitor/` directory holds three CSV files per machine, appended by the
+The utilisation samples are not in the queue folder. They are in the monitor
+folder: `monitor/` in the directory of `jobq_paths.toml`, or the folder that
+file names as `monitor_folder` (see
+[where the queue folder comes from](usage.md#where-the-queue-folder-comes-from)).
+
+```text
+<project>/
+├── jobq_paths.toml
+└── monitor/
+    ├── gpu.<hostname>.csv
+    ├── cpu.<hostname>.csv
+    ├── slots.<hostname>.csv
+    └── <name>.csv.lock             # one per sample file, appends against the daily trim
+```
+
+It holds three CSV files per machine, appended by the
 pool (or by `jobq monitor` on a machine that runs no pool) every
 `monitor_interval_s` seconds. Each file starts with a header row and is only
 ever appended to; rows older than `monitor_keep_days` are dropped once a day,

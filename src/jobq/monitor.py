@@ -1,11 +1,16 @@
-"""Utilisation sampling: GPU, CPU and slot rows written into the queue folder.
+"""Utilisation sampling: GPU, CPU and slot rows written into the monitor folder.
 
 A pool knows what its own jobs are doing, but not what the machine as a whole was doing
 while they ran, and nothing in the queue folder says whether a machine sat idle for a day.
-This module writes three plain CSV files per machine under ``<queue folder>/monitor/`` —
-one row per GPU per sample, one row per sample for the processor, and one row per sample
-for the pool's slot use — so a later ``jobq usage`` can put idle GPUs and finished jobs
-side by side over any window.
+This module writes three plain CSV files per machine into the monitor folder — one row
+per GPU per sample, one row per sample for the processor, and one row per sample for the
+pool's slot use — so a later ``jobq usage`` can put idle GPUs and finished jobs side by
+side over any window.
+
+The monitor folder is the caller's to name: the commands pass the one the settings file
+gives (``monitor/`` beside ``jobq_paths.toml`` unless ``monitor_folder`` says otherwise,
+see :mod:`jobq.settings`), so the samples sit in the project rather than among the queue
+state. A caller that names none gets ``monitor/`` in the queue folder.
 
 The readings themselves come from ``nvidia-smi`` and from ``/proc``, both behind small
 functions a caller can replace: :func:`query_gpu_samples` takes the GPU readings, and the
@@ -17,7 +22,7 @@ Rows are appended, never rewritten, and a row older than the keep window is drop
 day, header kept. Each file has a lock file of its own beside it, so an append and the
 daily trim of the same file cannot overlap. Every file is readable by anything that reads CSV, which is the point of
 the format: the machine that samples and the machine that reads need share nothing but the
-queue folder.
+monitor folder.
 """
 
 from __future__ import annotations
@@ -90,21 +95,26 @@ SLOT_COLUMNS = (
 TRIM_INTERVAL_S = 86400.0
 
 
-def monitor_dir(root: Path) -> Path:
-    """The directory holding the sample files of every machine."""
+def monitor_dir(root: Path, monitor_folder: Path | None = None) -> Path:
+    """The directory holding the sample files of every machine.
+
+    ``monitor_folder`` when the caller names one, otherwise ``monitor/`` in the queue folder.
+    """
+    if monitor_folder is not None:
+        return Path(monitor_folder)
     return Path(root) / "monitor"
 
 
-def gpu_csv_path(root: Path, hostname: str) -> Path:
-    return monitor_dir(root) / f"gpu.{hostname}.csv"
+def gpu_csv_path(root: Path, hostname: str, monitor_folder: Path | None = None) -> Path:
+    return monitor_dir(root, monitor_folder) / f"gpu.{hostname}.csv"
 
 
-def cpu_csv_path(root: Path, hostname: str) -> Path:
-    return monitor_dir(root) / f"cpu.{hostname}.csv"
+def cpu_csv_path(root: Path, hostname: str, monitor_folder: Path | None = None) -> Path:
+    return monitor_dir(root, monitor_folder) / f"cpu.{hostname}.csv"
 
 
-def slots_csv_path(root: Path, hostname: str) -> Path:
-    return monitor_dir(root) / f"slots.{hostname}.csv"
+def slots_csv_path(root: Path, hostname: str, monitor_folder: Path | None = None) -> Path:
+    return monitor_dir(root, monitor_folder) / f"slots.{hostname}.csv"
 
 
 def now_stamp() -> str:
@@ -396,8 +406,10 @@ class Sampler:
         occupancy=None,
         slot_state=None,
         sleep=None,
+        monitor_folder: Path | None = None,
     ) -> None:
         self.root = Path(root)
+        self.folder = monitor_dir(self.root, monitor_folder)
         self.hostname = hostname
         self.config = config or MonitorConfig()
         self.gpus = tuple(gpus)
@@ -448,7 +460,7 @@ class Sampler:
                 and reading.mem_used_mib < self.config.idle_mem_mib
             )
             append_row(
-                gpu_csv_path(self.root, self.hostname),
+                gpu_csv_path(self.root, self.hostname, self.folder),
                 GPU_COLUMNS,
                 {
                     "timestamp": timestamp,
@@ -467,7 +479,7 @@ class Sampler:
         load = read_loadavg() or (0.0, 0.0, 0.0)
         mem_used, mem_total = read_meminfo() or (0, 0)
         append_row(
-            cpu_csv_path(self.root, self.hostname),
+            cpu_csv_path(self.root, self.hostname, self.folder),
             CPU_COLUMNS,
             {
                 "timestamp": timestamp,
@@ -486,7 +498,7 @@ class Sampler:
     def _write_slots_row(self, timestamp: str) -> None:
         state = self._slot_state()
         append_row(
-            slots_csv_path(self.root, self.hostname),
+            slots_csv_path(self.root, self.hostname, self.folder),
             SLOT_COLUMNS,
             {
                 "timestamp": timestamp,
@@ -508,9 +520,9 @@ class Sampler:
             return
         self._next_trim = clock + TRIM_INTERVAL_S
         for path in (
-            gpu_csv_path(self.root, self.hostname),
-            cpu_csv_path(self.root, self.hostname),
-            slots_csv_path(self.root, self.hostname),
+            gpu_csv_path(self.root, self.hostname, self.folder),
+            cpu_csv_path(self.root, self.hostname, self.folder),
+            slots_csv_path(self.root, self.hostname, self.folder),
         ):
             trim_old_rows(path, self.config.keep_days)
 
@@ -679,12 +691,13 @@ def machine_usage(
     window_s: float | None,
     jobs_done: int,
     now: datetime | None = None,
+    monitor_folder: Path | None = None,
 ) -> MachineUsage:
     """One machine's row of the usage table, over the window."""
     moment = now or datetime.now(UTC)
-    gpu_rows = _within(read_rows(gpu_csv_path(root, hostname)), cutoff)
-    cpu_rows = _within(read_rows(cpu_csv_path(root, hostname)), cutoff)
-    slot_rows = _within(read_rows(slots_csv_path(root, hostname)), cutoff)
+    gpu_rows = _within(read_rows(gpu_csv_path(root, hostname, monitor_folder)), cutoff)
+    cpu_rows = _within(read_rows(cpu_csv_path(root, hostname, monitor_folder)), cutoff)
+    slot_rows = _within(read_rows(slots_csv_path(root, hostname, monitor_folder)), cutoff)
     per_gpu: dict[int, list[dict]] = {}
     for row in gpu_rows:
         try:
@@ -722,7 +735,11 @@ def machine_usage(
 
 
 def usage_report(
-    root: Path, *, window_s: float | None = None, now: datetime | None = None
+    root: Path,
+    *,
+    window_s: float | None = None,
+    now: datetime | None = None,
+    monitor_folder: Path | None = None,
 ) -> list[MachineUsage]:
     """The usage of every machine that has a policy file, over the window."""
     moment = now or datetime.now(UTC)
@@ -736,20 +753,29 @@ def usage_report(
             window_s=window_s,
             jobs_done=finished.get(host, 0),
             now=moment,
+            monitor_folder=monitor_folder,
         )
         for host in machines_with_a_policy(root)
     ]
 
 
 def recent_gpu_summary(
-    root: Path, hostname: str, *, window_s: float, now: datetime | None = None
+    root: Path,
+    hostname: str,
+    *,
+    window_s: float,
+    now: datetime | None = None,
+    monitor_folder: Path | None = None,
 ) -> tuple[float | None, int, int]:
     """Mean utilisation, idle GPUs and GPUs seen, over the last ``window_s`` of samples.
 
     A GPU counts as idle when its most recent sample in the window says so.
     """
     moment = now or datetime.now(UTC)
-    rows = _within(read_rows(gpu_csv_path(root, hostname)), moment - timedelta(seconds=window_s))
+    rows = _within(
+        read_rows(gpu_csv_path(root, hostname, monitor_folder)),
+        moment - timedelta(seconds=window_s),
+    )
     latest: dict[int, dict] = {}
     for row in rows:
         try:
@@ -851,7 +877,9 @@ def render_jobs_per_hour(report: list[MachineUsage], window_text: str | None) ->
     return lines
 
 
-def latest_slots_row(root: Path, hostname: str) -> dict | None:
+def latest_slots_row(
+    root: Path, hostname: str, monitor_folder: Path | None = None
+) -> dict | None:
     """The last slots row this machine wrote, or ``None`` when it has written none."""
-    rows = read_rows(slots_csv_path(root, hostname))
+    rows = read_rows(slots_csv_path(root, hostname, monitor_folder))
     return rows[-1] if rows else None

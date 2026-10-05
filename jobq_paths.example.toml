@@ -9,3 +9,9 @@
 # is yours, not the project's) and commit only this example.
 
 queue_folder = "/shared/me/jobq"
+
+# Utilisation samples (GPU, processor and slot use, as CSV files) go into
+# monitor/ beside this file, so they are at hand in the project. To put them
+# elsewhere, for example where several machines can all read them, name the
+# folder here.
+# monitor_folder = "/shared/me/jobq-monitor"
