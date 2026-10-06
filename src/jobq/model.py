@@ -97,6 +97,7 @@ class Job:
     env: dict[str, str] = field(default_factory=dict)
     mem_mib: int | None = None
     slots: int | None = None
+    gpu_count: int | None = None
     cwd: str | None = None
 
     @property
@@ -113,6 +114,8 @@ class Job:
             d["mem_mib"] = self.mem_mib
         if self.slots is not None:
             d["slots"] = self.slots
+        if self.gpu_count is not None:
+            d["gpu_count"] = self.gpu_count
         if self.cwd is not None:
             d["cwd"] = self.cwd
         return d
@@ -128,12 +131,18 @@ class Job:
             raise ValueError(f"job dict has no 'key' and no default: {d!r}")
         if "cmd" not in d:
             raise ValueError(f"job {key!r} has no 'cmd'")
+        gpu_count = None if d.get("gpu_count") is None else int(d["gpu_count"])
+        if gpu_count is not None and gpu_count < 1:
+            raise ValueError(
+                f"job {key!r} has gpu_count {gpu_count}; a job runs on one GPU or more"
+            )
         return cls(
             key=str(key),
             cmd=str(d["cmd"]),
             env={str(k): str(v) for k, v in (d.get("env") or {}).items()},
             mem_mib=None if d.get("mem_mib") is None else int(d["mem_mib"]),
             slots=None if d.get("slots") is None else int(d["slots"]),
+            gpu_count=gpu_count,
             cwd=None if d.get("cwd") is None else str(d["cwd"]),
         )
 

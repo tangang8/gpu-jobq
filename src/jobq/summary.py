@@ -88,6 +88,7 @@ class QueueSummary:
     parked_reason: str | None = None
     pause_left_s: float | None = None
     slots: int = 1
+    gpu_count: int = 1
     no_gpu: bool = False
     median_run_s: float | None = None
     median_samples: int = 0
@@ -162,6 +163,8 @@ class QueueSummary:
                 base += f", jobs {self.mem_job_min_mib}-{self.mem_job_max_mib}"
         if self.slots != 1:
             base += f", slots {self.slots}"
+        if self.gpu_count != 1:
+            base += f", {self.gpu_count} GPUs per job"
         return base
 
     @property
@@ -508,6 +511,7 @@ def _memory_fields(root: Path, meta: store.QueueMeta, jobs: list, cache: dict) -
         "mem_job_min_mib": per_job[0] if per_job else None,
         "mem_job_max_mib": per_job[-1] if per_job else None,
         "slots": queue_slots,
+        "gpu_count": max(1, int(meta.defaults.get("gpu_count", 1) or 1)),
         "no_gpu": no_gpu,
     }
 

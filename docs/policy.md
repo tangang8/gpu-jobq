@@ -195,7 +195,7 @@ markers on the next successful watchdog pass.
 | `tempfail_max_requeues` | `8` | Automatic exit-75 retries before recording failure. |
 | `park_defer_max_s` | `600` | How long a worker waiting for capacity defers to eligible higher-priority waiters before also trying. Read when entering the wait. |
 | `reserve_after_s` | `120` | How long a claimed job waits for capacity before one GPU is held for it; `0` turns holding off. |
-| `reserve_max_gpus` | `1` | How many GPUs of this machine may be held for waiting jobs at once. |
+| `reserve_max_gpus` | `1` | How many GPUs of this machine may be held for waiting jobs at once. A job with `gpu_count` above `1` is held that many, so a machine that runs such jobs sets this at least as high. |
 | `kill_grace_s` | `20` | Time allowed after `SIGTERM` before attempting `SIGKILL` for a job being terminated by the pool. |
 | `orphan_claim_grace_s` | `120` | Minimum age before reclaiming a claim with no owner record; also requires two sightings at least five seconds apart. |
 | `failure_pause_s` | `900` | How long a queue paused by a run of failures stays paused before one job is tried; a success lifts the pause, a failure extends it by this long. `0` keeps it paused until `resume`, `requeue`, or a success of a job already running. The policy of the machine whose failure sets the pause, or whose worker tries the job, decides. |
@@ -212,7 +212,10 @@ more than the next job to end would give back: on every GPU it may use, what
 the GPU shows free less `reserve_mem_mib`, plus the largest single request
 held there, is still short of its own request. A job merely queued behind
 `cap_per_gpu` or a `cap_group` is waiting for a slot, and the next job to end
-gives it one, so no GPU is held for it.
+gives it one, so no GPU is held for it. A job that runs on several GPUs
+(`gpu_count`) is waiting for memory when fewer GPUs than it needs would admit
+it as their next job ends, and it is then held that many GPUs, in the same
+order of preference.
 
 While a GPU is held, no other job of this queue folder starts on it, whatever
 its priority; the jobs already running there run to the end, and the other

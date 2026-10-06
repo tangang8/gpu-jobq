@@ -575,7 +575,7 @@ class _Pool:
         # threads + the watchdog thread).
         self._running_lock = threading.Lock()
         # Queue is part of the identity: queues may reuse a job key on one GPU.
-        self._running: dict[int, dict[tuple[str, str], _RunHandle]] = {}
+        self._running: dict[int | None, dict[tuple[str, str], _RunHandle]] = {}
         # Claims this process currently owns, counted per (queue, jobkey). Noted once per
         # iteration right after claim_next and dropped exactly once by that iteration's
         # bracket finally (_admit_and_run). The supervisor's reap_orphan_claims() removes
@@ -796,14 +796,39 @@ class _Pool:
         with self._lock:
             skipped = {k for q, k in self._cwd_skipped if q == name}
         allowed = self._tie_gpus(meta)
-        if allowed is None or allowed:
-            if not skipped:
-                return None
-            return lambda job: job.jobkey not in skipped
+        room = self._gpu_room(meta)
         default = int(meta.defaults.get("slots", 1))
+        default_count = max(1, int(meta.defaults.get("gpu_count", 1)))
+
+        def fits_here(job) -> bool:
+            # A job that runs on more GPUs than this machine can offer the queue is left
+            # to a machine that has them, rather than claimed and waited on for ever.
+            if (default if job.slots is None else job.slots) == 0:
+                return True
+            count = default_count if job.gpu_count is None else max(1, job.gpu_count)
+            return room is None or count <= room
+
+        if allowed is None or allowed:
+            if not skipped and (room is None or default_count <= room):
+                # Still per job: one job may ask for more GPUs than the queue's default.
+                return lambda job: fits_here(job)
+            return lambda job: job.jobkey not in skipped and fits_here(job)
         return lambda job: (
             (default if job.slots is None else job.slots) == 0 and job.jobkey not in skipped
         )
+
+    def _gpu_room(self, meta: QueueMeta) -> int | None:
+        """How many GPUs of this machine a queue may be placed on; ``None`` when unknown.
+
+        The GPUs both the tie and this machine's policy name, or every policy GPU when
+        the queue names none. A machine without a readable policy answers ``None``: it
+        has nothing to compare a job's GPU count against.
+        """
+        allowed = self._tie_gpus(meta)
+        if allowed is not None:
+            return len(allowed)
+        policy_gpus = self.gpu.policy_gpus()
+        return None if policy_gpus is None else len(policy_gpus)
 
     def _has_cpu_only_job(self, meta: QueueMeta) -> bool:
         """Whether any job of a queue takes no GPU, by its own field or the queue default.
@@ -1422,6 +1447,12 @@ class _Pool:
             return job.slots
         return int(meta.defaults.get("slots", 1))
 
+    def _effective_gpu_count(self, meta: QueueMeta, job: Job) -> int:
+        """How many GPUs the job runs on at once (job field > queue default > 1)."""
+        if job.gpu_count is not None:
+            return max(1, job.gpu_count)
+        return max(1, int(meta.defaults.get("gpu_count", 1)))
+
     def _effective_cwd(self, meta: QueueMeta, job: Job) -> str | None:
         """The directory the job asks to run in: job field, else the queue default.
 
@@ -1462,7 +1493,7 @@ class _Pool:
         )
 
     def _wait_no_longer_allowed(
-        self, name: str, slots: int, tie: tuple[int, ...] | None
+        self, name: str, slots: int, tie: tuple[int, ...] | None, gpu_count: int = 1
     ) -> str | None:
         """Why a thread waiting for capacity should give its claim back, or ``None``.
 
@@ -1484,6 +1515,12 @@ class _Pool:
             return "its queue is not tied to this machine any more"
         if slots > 0 and self._tie_gpus(meta) != tie:
             return "its queue does not allow the GPUs this job was going to use"
+        room = self._gpu_room(meta) if slots > 0 else None
+        if room is not None and gpu_count > room:
+            return (
+                f"it runs on {gpu_count} GPUs and this machine can offer its queue "
+                f"only {room}"
+            )
         return None
 
     def _acquire_gpu(
@@ -1497,6 +1534,7 @@ class _Pool:
         gpus: tuple[int, ...] | None = None,
         name: str | None = None,
         tie: tuple[int, ...] | None = None,
+        gpu_count: int = 1,
     ):
         """Block until capacity is free or a stop is requested (returns None on stop).
 
@@ -1523,7 +1561,7 @@ class _Pool:
         defer_since: float | None = None
         valve_logged = False
         waiting_since = time.monotonic()
-        reserved: int | None = None
+        reserved: tuple[int, ...] = ()
         unplaceable_logged = False
         with self._park_lock:
             self._parked[me] = (priority, cap_per_gpu, cap_group)
@@ -1534,7 +1572,7 @@ class _Pool:
                 if store.stop_path(self.root, self.hostname).exists():
                     return None
                 if name is not None:
-                    changed = self._wait_no_longer_allowed(name, slots, tie)
+                    changed = self._wait_no_longer_allowed(name, slots, tie, gpu_count)
                     if changed is not None:
                         self.master.log(
                             "WAIT",
@@ -1566,12 +1604,13 @@ class _Pool:
                     slots=slots,
                     cap_per_gpu=cap_per_gpu,
                     cap_group=cap_group,
+                    **({} if gpu_count == 1 else {"gpu_count": gpu_count}),
                     **({} if gpus is None else {"gpus": gpus}),
                 )
                 if slot is not None:
                     return slot
                 misses += 1
-                self._log_wait_miss(misses, job_key, mem_mib, slots)
+                self._log_wait_miss(misses, job_key, mem_mib, slots, gpu_count)
                 if slots > 0:
                     reserved, unplaceable_logged = self._maybe_reserve(
                         mem_mib,
@@ -1582,6 +1621,7 @@ class _Pool:
                         reserved,
                         unplaceable_logged,
                         gpus,
+                        gpu_count=gpu_count,
                     )
                 time.sleep(self.gpu_wait_s)
         finally:
@@ -1596,10 +1636,11 @@ class _Pool:
         job_key: str,
         priority: int,
         waited_s: float,
-        reserved: int | None,
+        reserved: tuple[int, ...],
         unplaceable_logged: bool,
         gpus: tuple[int, ...] | None = None,
-    ) -> tuple[int | None, bool]:
+        gpu_count: int = 1,
+    ) -> tuple[tuple[int, ...], bool]:
         """Ask this machine to hold a GPU for a job that has waited too long.
 
         Returns the GPU held for the job, if any, and whether the log has already said
@@ -1613,69 +1654,84 @@ class _Pool:
         that takes a GPU over writes the RELEASE for the job it took it from, and that
         job sees the GPU held for another and says nothing more about it.
         """
-        if not unplaceable_logged and not self.gpu.request_fits_somewhere(
-            mem_mib, slots, gpus
+        # Asked on every poll, not only until it has been said once: a request no set of
+        # GPUs here could ever grant must hold nothing, however long it waits.
+        if not self.gpu.request_fits_somewhere(
+            mem_mib, slots, gpus, *(() if gpu_count == 1 else (gpu_count,))
         ):
-            self.master.log(
-                "WAIT",
-                f"{job_key} asks for {mem_mib} MiB, which is more than any GPU of this "
-                "machine can grant even when it is empty, so no GPU is held for it",
-            )
+            if not unplaceable_logged:
+                what = (
+                    f"asks for {mem_mib} MiB, which is more than any GPU of this machine "
+                    "can grant even when it is empty"
+                    if gpu_count == 1
+                    else f"asks for {mem_mib} MiB on each of {gpu_count} GPUs, and this "
+                    "machine has no such set of GPUs even when they are empty"
+                )
+                self.master.log("WAIT", f"{job_key} {what}, so no GPU is held for it")
             return reserved, True
         displaced: list = []
-        gpu = self.gpu.reserve_for_wait(
-            mem_mib,
-            slots=slots,
-            job_key=job_key,
-            priority=priority,
-            waited_s=waited_s,
-            gpus=gpus,
-            displaced=displaced,
+        held = tuple(
+            self.gpu.reserve_gpus_for_wait(
+                mem_mib,
+                slots=slots,
+                job_key=job_key,
+                priority=priority,
+                waited_s=waited_s,
+                gpus=gpus,
+                displaced=displaced,
+                gpu_count=gpu_count,
+            )
         )
-        if gpu is not None and gpu != reserved:
-            for other in displaced:
-                self.master.log(
-                    "RELEASE",
-                    f"gpu {gpu} was held for {other} and is held for {job_key} now, "
-                    f"which has the higher priority; {other} waits for a GPU like any "
-                    "other job",
-                )
+        new = [g for g in held if g not in reserved]
+        for gpu, other in zip(new, displaced, strict=False):
+            self.master.log(
+                "RELEASE",
+                f"gpu {gpu} was held for {other} and is held for {job_key} now, "
+                f"which has the higher priority; {other} waits for a GPU like any "
+                "other job",
+            )
+        if new:
+            text = (
+                f"gpu {new[0]} is" if len(new) == 1 else "gpus " + ",".join(map(str, new)) + " are"
+            )
+            of = f" ({len(held)} of {gpu_count} it needs)" if gpu_count > 1 else ""
             self.master.log(
                 "RESERVE",
-                f"gpu {gpu} is held for {job_key} ({mem_mib} MiB, priority {priority}, "
+                f"{text} held for {job_key}{of} ({mem_mib} MiB, priority {priority}, "
                 f"waiting {int(waited_s)}s); no other job of this queue folder starts "
                 "there until it does",
             )
-        elif gpu is None and reserved is not None:
+        for gpu in reserved:
             # A GPU that is held for another job now was taken over, and the job that
             # took it has already said so.
-            if self.gpu.reservation_holder(reserved) is None:
+            if gpu not in held and self.gpu.reservation_holder(gpu) is None:
                 self.master.log(
                     "RELEASE",
-                    f"gpu {reserved} is free for other jobs again; it was held for "
-                    f"{job_key}",
+                    f"gpu {gpu} is free for other jobs again; it was held for {job_key}",
                 )
-        return gpu, unplaceable_logged
+        return held, unplaceable_logged
 
-    def _release_reservation(self, job_key: str, reserved: int | None) -> None:
-        """Give back the GPU held for a job that has stopped waiting for one.
+    def _release_reservation(self, job_key: str, reserved: tuple[int, ...]) -> None:
+        """Give back the GPUs held for a job that has stopped waiting for them.
 
         Only a GPU this job still holds is given back, and only that is reported: a
         GPU taken over by a job that outranked this one belongs to that job, and it
         wrote the line about the change when it took it.
         """
         try:
-            gpu = self.gpu.release_reservation(job_key)
+            given = self.gpu.release_reservations(job_key)
         except OSError as exc:
             logger.warning("could not release the GPU held for {}: {}", job_key, exc)
             return
-        if gpu is not None:
+        for gpu in given:
             self.master.log(
                 "RELEASE",
                 f"gpu {gpu} is free for other jobs again; it was held for {job_key}",
             )
 
-    def _log_wait_miss(self, misses: int, job_key: str, mem_mib: int, slots: int) -> None:
+    def _log_wait_miss(
+        self, misses: int, job_key: str, mem_mib: int, slots: int, gpu_count: int = 1
+    ) -> None:
         """Rate-limited WAIT line for a parked thread (first miss, then ~once a minute)."""
         per_min = max(1, int(60 / max(self.gpu_wait_s, 0.001)))
         if misses != 1 and misses % per_min != 0:
@@ -1688,6 +1744,8 @@ class _Pool:
             hint = " — all cpu_cap slots held; check cpu_cap in this machine's gpu_policy"
         else:
             need = f"{mem_mib} MiB free + {slots} slot-unit(s)"
+            if gpu_count > 1:
+                need += f" on each of {gpu_count} GPUs at once"
             hint = " — check mem_mib/slots against this machine's gpu_policy"
         self.master.log(
             "WAIT",
@@ -1781,7 +1839,7 @@ class _Pool:
                 "in the queue",
             )
             return None
-        store.update_owner_gpu(self.root, name, job.jobkey, slot.gpu)
+        store.update_owner_gpu(self.root, name, job.jobkey, slot.gpu, gpus=slot.all_gpus)
         pid = os.getpid()
         stamp = utc_stamp()
         # The attempt is part of the name, so each attempt of a job has a log of its
@@ -1804,14 +1862,16 @@ class _Pool:
         # slots=0 (declared CPU-only): no GPU was reserved, so hide every device rather than
         # leaving the inherited value visible -- a job that claimed no slot must not be able
         # to quietly grab a GPU and oversubscribe it.
-        env["CUDA_VISIBLE_DEVICES"] = "" if slot.is_cpu_only else str(slot.gpu)
+        # A job that runs on several GPUs sees them all, in the order they were granted.
+        env["CUDA_VISIBLE_DEVICES"] = slot.gpu_text
         env.update(
             {
                 "JOBQ_QUEUE": name,
                 "JOBQ_JOB_KEY": job.key,
                 "JOBQ_ATTEMPT": str(attempt),
                 "JOBQ_NODE": self.hostname,
-                "JOBQ_GPU": "" if slot.is_cpu_only else str(slot.gpu),
+                "JOBQ_GPU": slot.gpu_text,
+                "JOBQ_GPU_COUNT": str(len(slot.all_gpus)),
             }
         )
         env[store.RUN_ID_ENV] = run_id
@@ -1832,7 +1892,7 @@ class _Pool:
             return 1
         with log_file as f:
             f.write(
-                f"=== node={self.hostname} pid={pid} gpu={slot.gpu} "
+                f"=== node={self.hostname} pid={pid} gpu={slot.gpu_text} "
                 f"queue={name} job={job.key} start={start} ===\n"
             )
             f.flush()
@@ -1871,7 +1931,10 @@ class _Pool:
             # was starting ends it here, so no process of this pool outlives it whatever
             # the timing.
             with self._running_lock:
-                self._running.setdefault(slot.gpu, {})[(name, job.jobkey)] = handle
+                # Under every GPU the job holds, so a yield of any of them ends the job;
+                # a job that holds none is registered under ``None``.
+                for g in slot.all_gpus or (None,):
+                    self._running.setdefault(g, {})[(name, job.jobkey)] = handle
             if self.end_now.is_set():
                 self._end_one_running(handle, self._end_now_reason())
             # The claim now names the job itself, not only this pool: a pool that is killed
@@ -1885,8 +1948,9 @@ class _Pool:
             finally:
                 with self._running_lock:
                     key = (name, job.jobkey)
-                    if self._running.get(slot.gpu, {}).get(key) is handle:
-                        self._running.get(slot.gpu, {}).pop(key, None)
+                    for g in slot.all_gpus or (None,):
+                        if self._running.get(g, {}).get(key) is handle:
+                            self._running.get(g, {}).pop(key, None)
         # Read the peak before any branch that returns without recording a result (a log
         # read, no store write, so the settled contract is untouched): a yield-killed, OOM or
         # tempfail attempt records nothing, and those are the attempts whose memory matters
@@ -2155,12 +2219,15 @@ class _Pool:
         same request the moment it has registered its process.
         """
         with self._running_lock:
-            handles = [
-                h
-                for jobs in self._running.values()
-                for h in jobs.values()
-                if not h.killed and h.proc.poll() is None
-            ]
+            # A job on several GPUs is registered under each; it is ended once.
+            handles = list(
+                {
+                    id(h): h
+                    for jobs in self._running.values()
+                    for h in jobs.values()
+                    if not h.killed and h.proc.poll() is None
+                }.values()
+            )
         ended: list[str] = []
         for h in handles:
             self._end_one_running(h, why)
@@ -2504,6 +2571,7 @@ class _Pool:
                     return "next"
             mem_mib = self._effective_mem(name, meta, job)
             slots = self._effective_slots(meta, job)
+            gpu_count = self._effective_gpu_count(meta, job)
             # A job that declares ``slots: 0`` takes the CPU lane whatever its queue's
             # default is: what it needs is a cpu_cap slot, and parking it on GPU
             # capacity would hold a worker thread on a budget it never draws from.
@@ -2520,6 +2588,7 @@ class _Pool:
                         slots=slots,
                         cap_per_gpu=cap,
                         cap_group=group,
+                        **({} if gpu_count == 1 else {"gpu_count": gpu_count}),
                         **({} if gpus is None else {"gpus": gpus}),
                     )
                 except Exception:
@@ -2541,7 +2610,7 @@ class _Pool:
                     slot = self._acquire_gpu(
                         mem_mib, slots, cap, group, job.key,
                         priority=meta.priority, gpus=gpus,
-                        name=name, tie=self._tie_gpus(meta),
+                        name=name, tie=self._tie_gpus(meta), gpu_count=gpu_count,
                     )
                 except Exception:
                     store.remove_claim(self.root, name, job.jobkey)  # never strand a claim
@@ -2571,7 +2640,7 @@ class _Pool:
         # carries the attempt the job is really on rather than a stand-in.
         attempt = store.read_attempt(self.root, name, job.jobkey)
         try:
-            self.master.log("START", f"{name} {job.key} gpu={slot.gpu}")
+            self.master.log("START", f"{name} {job.key} gpu={slot.gpu_text}")
             peak_out: list = []  # filled by _run_job when the job reported a peak
             rc = self._run_job(name, meta, job, slot, attempt, settled, peak_out=peak_out)
             if rc is not None:  # None: yield-killed or requeued, already logged
@@ -3019,9 +3088,10 @@ def drain_sentence(running: int, signal_name: str | None, *, first: bool) -> str
 def _running_job_count(pool: _Pool) -> int:
     """How many job processes of this pool are running right now."""
     with pool._running_lock:
-        return sum(
-            1 for jobs in pool._running.values() for h in jobs.values() if h.proc.poll() is None
-        )
+        live = {
+            id(h) for jobs in pool._running.values() for h in jobs.values() if h.proc.poll() is None
+        }
+    return len(live)
 
 
 class _Shutdown:

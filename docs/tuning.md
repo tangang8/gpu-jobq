@@ -141,6 +141,11 @@ multiplying its memory request. With `cap_per_gpu: 4`, it leaves two units for
 other jobs. A weight above the policy cap is clamped to that cap. Without an
 explicit policy cap, the internal range is 64 units.
 
+A job with `gpu_count: 2` uses its `slots` units on each of two GPUs and needs
+its `mem_mib` free on each, since each GPU carries one shard of it. The GPUs
+are the two least loaded that pass every check, and the job starts only when
+both do.
+
 The queue cap counts each job once, whatever its slot weight. For example,
 a queue with `--cap-per-gpu 2` can place two jobs on a GPU only if their combined
 slot weight and memory also fit the machine's limits.

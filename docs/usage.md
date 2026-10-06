@@ -71,11 +71,25 @@ with `#` are ignored. This example shows all per-job fields:
 | `cmd` | Command passed to `bash -c` | Required |
 | `mem_mib` | GPU memory request in MiB; use a positive integer for GPU jobs | Queue `--mem-mib`, then policy `free_mem_mib` |
 | `slots` | Weight on one GPU, or `0` for CPU-only work | Queue `--slots`, then `1` |
+| `gpu_count` | How many GPUs the job runs on at once, one shard per GPU | Queue `--gpu-count`, then `1` |
 | `cwd` | Working directory; use an absolute path | Queue `--cwd`, or the directory of the first submission |
 | `env` | Environment variables added or overridden for this job | Queue and machine values still apply |
 
 `slots: 2` reserves two units of capacity on one GPU. It does not request two
-GPUs. jobq does not schedule a multi-GPU allocation for a single job.
+GPUs; `gpu_count` does. A job with `gpu_count: 4` is admitted onto four GPUs at
+once, taking its `slots` units on each of them with its `mem_mib` free there,
+and runs with all four in `CUDA_VISIBLE_DEVICES` (and in `JOBQ_GPU`, with
+`JOBQ_GPU_COUNT` saying how many). The grant is all-or-nothing: until four GPUs
+of the machine can each take it, the job waits and holds nothing. `mem_mib` is
+per GPU, the memory one shard needs, so other jobs may share those GPUs when
+the cap and the memory allow it. A job that uses no GPU (`slots: 0`) cannot ask
+for several.
+
+A multi-GPU job that keeps losing GPUs to smaller jobs is held GPUs the way a
+large single-GPU job is held one (see [the policy
+reference](policy.md#retries-and-process-termination)); `reserve_max_gpus` on the machine
+bounds how many it may hold, so set it at least as high as the GPUs such jobs
+need.
 
 A key becomes a filename called its jobkey: pipes, slashes, backslashes,
 and whitespace runs become `__`. For example, `train|seed-1` becomes
@@ -136,6 +150,9 @@ jobq submit train --jobs-file train.jsonl \
   --cwd /shared/me/project --mem-mib 12000 --slots 1 \
   --env OMP_NUM_THREADS=2 --env PYTHONUNBUFFERED=1
 ```
+
+`--gpu-count N` sets the queue's default number of GPUs per job, for a queue
+of jobs that each run on several.
 
 Later, append only new keys:
 

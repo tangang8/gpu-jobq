@@ -1489,18 +1489,28 @@ def read_owner(root: Path, name: str, jobkey: str) -> dict | None:
     return _owner_state(root, name, jobkey)[1]
 
 
-def update_owner_gpu(root: Path, name: str, jobkey: str, gpu: int | None) -> None:
+def update_owner_gpu(
+    root: Path,
+    name: str,
+    jobkey: str,
+    gpu: int | None,
+    *,
+    gpus: tuple[int, ...] | None = None,
+) -> None:
     """Stamp the acquired physical GPU into an existing claim's owner.json (best-effort).
 
     The claim is made before GPU acquisition, so ``gpu`` starts as null; this makes the live
     GPU visible to ``jobq status`` while the job runs. Stays ``None`` for a declared
-    CPU-only job (``slots: 0``), which reserves no GPU at all.
+    CPU-only job (``slots: 0``), which reserves no GPU at all. A job on several GPUs
+    records them all as ``gpus``; ``gpu`` stays the first, for readers that expect one.
     """
     apply_folder_perms(root)
     owner = read_owner(root, name, jobkey)
     if owner is None:
         return
     owner["gpu"] = gpu
+    if gpus is not None and len(gpus) > 1:
+        owner["gpus"] = list(gpus)
     try:
         atomic_write_json(_owner_path(root, name, jobkey), owner)
     except OSError:
@@ -2861,6 +2871,7 @@ def queue_status(root: Path, name: str, *, with_deferred: bool = False) -> dict:
                     "node": owner.get("node"),
                     "pid": owner.get("pid"),
                     "gpu": owner.get("gpu"),
+                    "gpus": owner.get("gpus"),
                     "start_utc": owner.get("start_utc"),
                     **claim_liveness(owner, this_node=this_host()),
                 }

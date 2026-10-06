@@ -617,12 +617,20 @@ class Sampler:
             logger.info("utilisation sampling is working again")
 
     def run(self, stop: threading.Event) -> None:
-        """Sample every ``interval_s`` until ``stop`` is set; an interval of 0 returns at once."""
+        """Sample every ``interval_s`` until ``stop`` is set; an interval of 0 returns at once.
+
+        The interval is measured from the start of one round to the start of the next,
+        so the time a round takes — the processor reading alone waits ``cpu_sample_s``
+        — does not stretch it: rows land every ``interval_s``, not every
+        ``interval_s`` plus a few seconds.
+        """
         if self.config.interval_s <= 0:
             return
         while True:
+            started = time.monotonic()
             self.tick()
-            if stop.wait(self.config.interval_s):
+            spent = time.monotonic() - started
+            if stop.wait(max(0.0, self.config.interval_s - spent)):
                 return
 
 

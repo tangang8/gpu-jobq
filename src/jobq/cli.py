@@ -540,6 +540,13 @@ def submit(
         "admission-controlled. Only declare 0 if the jobs never touch CUDA -- they run with "
         "CUDA_VISIBLE_DEVICES emptied.",
     ),
+    gpu_count: int = typer.Option(
+        None,
+        "--gpu-count",
+        help="Queue-default number of GPUs each job runs on at once, one shard per GPU "
+        "(default 1). A job takes its slots and its mem_mib on each of them and sees them "
+        "all in CUDA_VISIBLE_DEVICES.",
+    ),
     cwd: Path = typer.Option(
         None,
         help="Directory to run these jobs in (default: the directory submit was run from).",
@@ -574,6 +581,12 @@ def submit(
         defaults["cap_group"] = cap_group
     if slots is not None:
         defaults["slots"] = slots
+    if gpu_count is not None:
+        if gpu_count < 1:
+            raise fail("--gpu-count must be at least 1 (got {}); a job runs on one GPU or more", gpu_count)
+        if slots == 0:
+            raise fail("--gpu-count does not go with --slots 0: a job that uses no GPU runs on none")
+        defaults["gpu_count"] = gpu_count
     if max_consecutive_failures is not None:
         defaults["max_consecutive_failures"] = max_consecutive_failures
     # The queue's default working directory. Recorded absolutely, so a pool started
@@ -595,6 +608,7 @@ def submit(
     requested_defaults = {
         "mem_mib": mem_mib,
         "slots": slots,
+        "gpu_count": gpu_count,
         "cap_per_gpu": cap_per_gpu,
         "cap_group": cap_group,
         "max_consecutive_failures": max_consecutive_failures,

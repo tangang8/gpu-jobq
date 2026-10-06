@@ -78,7 +78,8 @@ without it and says which command writes it.
 
 **3. Create a jobs file.** It is a text file with one job per line, each line a
 JSON object with a unique name, `key`, and the shell command to run, `cmd`. A
-line may also carry `mem_mib`, `slots`, `env` and `cwd` for that job alone; the
+line may also carry `mem_mib`, `slots`, `gpu_count`, `env` and `cwd` for that job
+alone; the
 [usage guide](docs/usage.md) has the full format. This example checks placement
 without requiring a training script. Run it from a directory that all worker
 machines can access:

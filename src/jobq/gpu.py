@@ -1192,18 +1192,33 @@ def _mark_ask_released(path: str) -> None:
 
 
 @dataclass
+class _Taken:
+    """Locks taken on one GPU during an admission, before the memory gate has spoken."""
+
+    gpu: int
+    held: list[tuple[int, int]]  # (slot index, fd)
+    group_fd: int | None
+    asks: list[dict]
+
+
+@dataclass
 class GpuSlot:
     """Held capacity on physical GPU ``gpu``. ``release()`` drops the flocks (idempotent).
 
     ``_fds`` holds one lock fd per consumed slot-unit (a weighted job holds several).
     ``_group_fd`` is the additional per-cap-group slot lock when the queue declared its own
     ``cap_per_gpu`` (a stage ceiling on top of the global policy ceiling).
+
+    A job that runs on several GPUs holds ``slots`` units on each of them: ``gpus`` names
+    them all, ``gpu`` is the first, and the lists of fds cover every GPU.
     """
 
     gpu: int | None
     slot: int
     _fds: list[int] = field(default_factory=list)
     _group_fd: int | None = None
+    _group_fds: list[int] = field(default_factory=list)
+    gpus: tuple[int, ...] = ()
     # The owning manager's live-fd registry (see GpuManager._live_lock_fds); release()
     # deregisters so the leak auditor knows these fds are legitimately gone. Mutations go
     # under the manager's ``_reg_lock`` so they serialize with the auditor's audit pass.
@@ -1234,6 +1249,18 @@ class GpuSlot:
         """True for a ``slots=0`` slot: it holds a CPU-budget lock, never GPU capacity."""
         return self.gpu is None
 
+    @property
+    def all_gpus(self) -> tuple[int, ...]:
+        """Every GPU this slot holds capacity on, in the order they were granted."""
+        if self.gpus:
+            return self.gpus
+        return () if self.gpu is None else (self.gpu,)
+
+    @property
+    def gpu_text(self) -> str:
+        """The granted GPUs as the job sees them: ``"0,1"``, or empty for a CPU-only job."""
+        return ",".join(str(g) for g in self.all_gpus)
+
     def release(self) -> None:
         reg = self._registry
         with self._reg_lock if self._reg_lock is not None else contextlib.nullcontext():
@@ -1242,10 +1269,12 @@ class GpuSlot:
                 if reg is not None:
                     reg.discard(fd)
             self._fds = []
-            if self._group_fd is not None and reg is not None:
-                reg.discard(self._group_fd)
-            _close_lock(self._group_fd)
+            for fd in [self._group_fd, *self._group_fds]:
+                if fd is not None and reg is not None:
+                    reg.discard(fd)
+                _close_lock(fd)
             self._group_fd = None
+            self._group_fds = []
             for path in self._ask_paths:
                 _mark_ask_released(path)
             self._ask_paths = []
@@ -1269,12 +1298,14 @@ class GpuInterface(abc.ABC):
         cap_per_gpu: int | None = None,
         cap_group: str | None = None,
         gpus: tuple[int, ...] | None = None,
+        gpu_count: int = 1,
     ) -> GpuSlot | None:
         """Reserve capacity for one job, or return ``None`` while none is available.
 
         ``gpus`` restricts the job to those GPU numbers, for a queue tied to some of a
         machine's GPUs; ``None`` leaves the choice to this machine's policy. The caller
-        passes it only for a queue that names GPUs.
+        passes it only for a queue that names GPUs. ``gpu_count`` is how many GPUs the
+        job runs on at once; it takes ``slots`` units and ``mem_mib`` on each of them.
         """
 
     @abc.abstractmethod
@@ -1343,9 +1374,28 @@ class GpuInterface(abc.ABC):
         """Hold a GPU for a job that has waited too long, and say which; ``None`` = none."""
         return None
 
+    def reserve_gpus_for_wait(
+        self,
+        mem_mib: int,
+        *,
+        slots: int = 1,
+        job_key: str,
+        priority: int = 0,
+        waited_s: float = 0.0,
+        gpus: tuple[int, ...] | None = None,
+        displaced: list | None = None,
+        gpu_count: int = 1,
+    ) -> tuple[int, ...]:
+        """Hold up to ``gpu_count`` GPUs for a job that has waited too long; all it holds."""
+        return ()
+
     def release_reservation(self, job_key: str | None = None) -> int | None:
         """Give back the GPU this thread holds for a waiting job; ``None`` = it held none."""
         return None
+
+    def release_reservations(self, job_key: str | None = None) -> list[int]:
+        """Give back every GPU this thread holds for a waiting job; the GPUs given back."""
+        return []
 
     def release_dead_reservations(self, waiting_tids=None) -> list[int]:
         """Give back the GPUs held for threads of this pool that are not waiting any more."""
@@ -1360,7 +1410,11 @@ class GpuInterface(abc.ABC):
         return {}
 
     def request_fits_somewhere(
-        self, mem_mib: int, slots: int = 1, gpus: tuple[int, ...] | None = None
+        self,
+        mem_mib: int,
+        slots: int = 1,
+        gpus: tuple[int, ...] | None = None,
+        gpu_count: int = 1,
     ) -> bool:
         """Whether some GPU here could ever grant this request (True = nothing says no)."""
         return True
@@ -1771,51 +1825,86 @@ class GpuManager(GpuInterface):
     ) -> bool:
         """Whether GPU ``g`` can take a ``mem_mib`` job and still show ``reserve`` MiB free.
 
+        The one-GPU form of :meth:`_mem_ok_all`, which has the details.
+        """
+        return g in self._mem_ok_all(
+            [g], mem_mib, reserve, policy, asks=None if asks is None else {g: asks}
+        )
+
+    def _mem_ok_all(
+        self,
+        candidates: list[int],
+        mem_mib: int,
+        reserve: int = 0,
+        policy: GpuPolicy | None = None,
+        asks: dict[int, list[dict]] | None = None,
+    ) -> set[int]:
+        """Which of ``candidates`` can take a ``mem_mib`` job and still show ``reserve`` free.
+
         ``reserve`` is what must stay free on top of the job's own ask: this machine's policy
         ``reserve_mem_mib``. It is passed in by the caller so the policy keeps being
         re-read once per acquire (hot-reload).
 
-        ``asks`` are the records of the jobs already holding slots on the GPU. The
+        ``asks`` are the records of the jobs already holding slots on each GPU. The
         memory of a just-granted job may not be visible in a reading yet, so its ask is
         held against that reading (see :meth:`_startup_hold_mib`) — and the hold is
         worked out from the very reading the gate is about to judge, not from an earlier
         one: the gate settles for seconds between readings, and a hold computed against
         the older reading credits the GPU with memory that has been taken since.
+
+        Several GPUs are judged from the same readings, so a job that runs on several
+        settles once rather than once per GPU. A GPU fails on its first short reading
+        and passes once every reading was enough, or at once when the first shows
+        ample headroom.
         """
         policy = policy if policy is not None else self._policy()
         checks = self._gate(policy, "mem_checks")
         interval = self._gate(policy, "mem_interval_s")
         fastpath = self._gate(policy, "mem_fastpath_factor")
+        undecided = list(candidates)
+        passed: set[int] = set()
         for i in range(checks):
+            if not undecided:
+                break
             if i:
                 time.sleep(interval)
             try:
-                free = self.mem_query().get(g, 0)
+                readings = self.mem_query()
             except (subprocess.SubprocessError, OSError, ValueError):
                 # A hung or broken smi (bounded by the query timeout) denies this
                 # admission instead of raising through acquire while slot fds are held.
-                logger.warning("nvidia-smi free-memory query failed; denying admission on GPU {}", g)
-                return False
-            # Freshest reading of this GPU, kept for the ask record's baseline: the
-            # snapshot taken at the top of an acquire is older by however long the gate
-            # settled, and an over-old baseline would over-credit the next job's hold.
-            self._last_free[g] = free
-            self._note_free_seen({g: free})
-            hold = (
-                0
-                if not asks
-                else self._startup_hold_mib(asks, free, policy.startup_hold_s)
-            )
-            headroom = free - reserve - hold
-            if headroom < mem_mib:
-                return False
-            if (
-                fastpath > 0
-                and headroom >= mem_mib * fastpath
-                and headroom >= mem_mib + 4096
-            ):
-                return True  # ample headroom: skip the settle sleep + re-check
-        return True
+                logger.warning(
+                    "nvidia-smi free-memory query failed; denying admission on GPU {}",
+                    ",".join(str(g) for g in undecided),
+                )
+                return passed
+            still: list[int] = []
+            for g in undecided:
+                free = readings.get(g, 0)
+                # Freshest reading of this GPU, kept for the ask record's baseline: the
+                # snapshot taken at the top of an acquire is older by however long the
+                # gate settled, and an over-old baseline would over-credit the next
+                # job's hold.
+                self._last_free[g] = free
+                self._note_free_seen({g: free})
+                held = (asks or {}).get(g) or []
+                hold = (
+                    0 if not held else self._startup_hold_mib(held, free, policy.startup_hold_s)
+                )
+                headroom = free - reserve - hold
+                if headroom < mem_mib:
+                    continue  # one short reading settles it: not this GPU
+                if (
+                    fastpath > 0
+                    and headroom >= mem_mib * fastpath
+                    and headroom >= mem_mib + 4096
+                ):
+                    passed.add(g)  # ample headroom: skip the settle sleep + re-check
+                    continue
+                still.append(g)
+            undecided = still
+        passed.update(undecided)
+        return passed
 
     # ------------------- memory accounting -------------------
 
@@ -2051,14 +2140,19 @@ class GpuManager(GpuInterface):
         return [g for g in policy.gpus if g in wanted]
 
     def request_fits_somewhere(
-        self, mem_mib: int, slots: int = 1, gpus: tuple[int, ...] | None = None
+        self,
+        mem_mib: int,
+        slots: int = 1,
+        gpus: tuple[int, ...] | None = None,
+        gpu_count: int = 1,
     ) -> bool:
-        """Whether a GPU open to this job could ever grant ``mem_mib``, empty of everything.
+        """Whether GPUs open to this job could ever grant ``mem_mib``, empty of everything.
 
         Read from the GPUs' total memory less this machine's reserve, and from the
         budget this machine sets on what our jobs may ask for on one GPU. Totals that
         cannot be read answer yes: an unknown machine must not be reported as one where
-        the job can never run.
+        the job can never run. A job that runs on several GPUs needs that many GPUs
+        that could each grant it.
         """
         policy = self._policy_or_none()
         if policy is None or not policy.gpus:
@@ -2067,10 +2161,10 @@ class GpuManager(GpuInterface):
         open_to_it = self._allowed(policy, gpus)
         if not open_to_it:
             return False  # its queue names GPUs, and this policy selects none of them
-        return any(
-            self._could_ever_admit(policy, totals, g, mem_mib, slots)
-            for g in open_to_it
+        able = sum(
+            1 for g in open_to_it if self._could_ever_admit(policy, totals, g, mem_mib, slots)
         )
+        return able >= max(1, gpu_count)
 
     def reserve_for_wait(
         self,
@@ -2083,6 +2177,30 @@ class GpuManager(GpuInterface):
         gpus: tuple[int, ...] | None = None,
         displaced: list | None = None,
     ) -> int | None:
+        """The one-GPU form of :meth:`reserve_gpus_for_wait`: the GPU held, or ``None``."""
+        held = self.reserve_gpus_for_wait(
+            mem_mib,
+            slots=slots,
+            job_key=job_key,
+            priority=priority,
+            waited_s=waited_s,
+            gpus=gpus,
+            displaced=displaced,
+        )
+        return held[0] if held else None
+
+    def reserve_gpus_for_wait(
+        self,
+        mem_mib: int,
+        *,
+        slots: int = 1,
+        job_key: str,
+        priority: int = 0,
+        waited_s: float = 0.0,
+        gpus: tuple[int, ...] | None = None,
+        displaced: list | None = None,
+        gpu_count: int = 1,
+    ) -> tuple[int, ...]:
         """Hold one GPU for a job that keeps losing the memory it is waiting for.
 
         A large request can wait for ever while smaller ones take every piece of memory
@@ -2121,12 +2239,19 @@ class GpuManager(GpuInterface):
         ``displaced`` is a list the key of a job whose GPU was taken is appended to, for
         a caller that reports the change.
 
-        Returns the GPU index held for this job (its own reservation if it already has
-        one), or ``None`` when nothing was reserved.
+        A job that runs on several GPUs is held that many, taken in the same order of
+        preference, one reservation per GPU; it is waiting for memory only when fewer
+        GPUs than it needs would admit it as their next job ends. The machine-wide cap
+        applies to the set: a job cannot hold more GPUs than ``reserve_max_gpus`` allows,
+        so a machine that runs such jobs sets the cap at least as high as their count.
+
+        Returns the GPUs held for this job (its own reservations if it already has
+        them, and any added now), empty when nothing is reserved.
         """
         policy = self._policy_or_none()
         if policy is None or not policy.gpus:
-            return None
+            return ()
+        count = max(1, int(gpu_count))
         acq_fd: int | None = None
         try:
             acq_fd = os.open(
@@ -2137,21 +2262,38 @@ class GpuManager(GpuInterface):
             for g in policy.gpus:
                 if g in yielded:
                     self._clear_reservation(g)  # a GPU we promised away holds nothing
-            held = self._adopt_reservation(policy, job_key, yielded)
-            if held is not None:
-                return held
+            held = self._adopt_reservations(policy, job_key, yielded)
+            if len(held) >= count:
+                return tuple(held)
             if policy.reserve_after_s <= 0 or policy.reserve_max_gpus <= 0:
-                return None
-            if waited_s < policy.reserve_after_s:
-                return None
+                return tuple(held)
+            if not held and waited_s < policy.reserve_after_s:
+                return ()
             try:
                 free = self.mem_query()
             except (subprocess.SubprocessError, OSError, ValueError):
-                return None  # no readings, no decision
+                return tuple(held)  # no readings, no decision
             self._note_free_seen(free)
             totals = total_mem(self.total_query)
-            if not self._waiting_on_memory(policy, free, mem_mib, gpus, yielded):
-                return None
+            able = [
+                g
+                for g in self._allowed(policy, gpus)
+                if g not in yielded and self._could_ever_admit(policy, totals, g, mem_mib, slots)
+            ]
+            if len(able) < count:
+                # No set of GPUs here could ever grant the job: nothing is held for it,
+                # and a GPU held before the machine changed is given back.
+                for g in held:
+                    self._clear_reservation(g)
+                return ()
+            # A job already holding part of its set presses on to complete it: it
+            # qualified when it got its first hold, and stopping half-way would leave
+            # GPUs held for a job that cannot start while another job's partial set
+            # keeps it from the rest — each waiting on the other for ever.
+            if not held and not self._waiting_on_memory(
+                policy, free, mem_mib, gpus, yielded, count
+            ):
+                return ()
             live: dict[int, dict] = {}
             for g in policy.gpus:  # every reservation on the machine counts against the cap
                 if g in yielded:
@@ -2161,7 +2303,7 @@ class GpuManager(GpuInterface):
                     live[g] = rec
             candidates: list[tuple[int, int, int]] = []
             for g in self._allowed(policy, gpus):
-                if g in yielded or not self._could_ever_admit(
+                if g in held or g in yielded or not self._could_ever_admit(
                     policy, totals, g, mem_mib, slots
                 ):
                     continue
@@ -2172,21 +2314,28 @@ class GpuManager(GpuInterface):
                 if empty < mem_mib:
                     continue
                 candidates.append((-headroom, len(asks), g))
-            if not candidates:
-                return None
             candidates.sort()
-            target = next((g for _h, _n, g in candidates if g not in live), None)
-            if target is None or len(live) >= policy.reserve_max_gpus:
-                target = self._reservation_to_take_over(
-                    live, [g for _h, _n, g in candidates], priority, waited_s
-                )
-            if target is None:
-                return None
-            taken = live.get(target)
-            if taken is not None and displaced is not None:
-                displaced.append(taken.get("job"))
-            self._write_reservation(target, mem_mib, job_key, priority, waited_s)
-            return target
+            ordered = [g for _h, _n, g in candidates]
+            chosen = list(held)
+            while len(chosen) < count:
+                open_ones = [g for g in ordered if g not in chosen]
+                target = next((g for g in open_ones if g not in live), None)
+                if target is None or len(live) >= policy.reserve_max_gpus:
+                    target = self._reservation_to_take_over(
+                        {g: rec for g, rec in live.items() if g not in chosen},
+                        open_ones,
+                        priority,
+                        waited_s,
+                    )
+                if target is None:
+                    break
+                taken = live.get(target)
+                if taken is not None and displaced is not None:
+                    displaced.append(taken.get("job"))
+                self._write_reservation(target, mem_mib, job_key, priority, waited_s)
+                live[target] = {"job": job_key, "priority": priority, "waited_s": waited_s}
+                chosen.append(target)
+            return tuple(chosen)
         finally:
             _close_lock(acq_fd)
 
@@ -2197,6 +2346,7 @@ class GpuManager(GpuInterface):
         mem_mib: int,
         gpus: tuple[int, ...] | None,
         yielded,
+        gpu_count: int = 1,
     ) -> bool:
         """Whether memory, rather than a turn, is what this job is waiting for.
 
@@ -2219,14 +2369,17 @@ class GpuManager(GpuInterface):
         open_to_it = [g for g in self._allowed(policy, gpus) if g not in yielded]
         if not open_to_it:
             return False
+        # A job on several GPUs is waiting for a turn when that many GPUs would each
+        # admit it as their next job ends; fewer than that, and it is waiting for memory.
+        would_admit = 0
         for g in open_to_it:
             headroom = free.get(g, 0) - policy.reserve_mem_mib
             biggest = max(
                 (self._ask_mib(a) for a in self._read_asks(g, policy)), default=0
             )
             if headroom + biggest >= mem_mib:
-                return False
-        return True
+                would_admit += 1
+        return would_admit < max(1, gpu_count)
 
     def _could_ever_admit(
         self,
@@ -2256,16 +2409,17 @@ class GpuManager(GpuInterface):
         total = totals.get(g)
         return total is None or total - policy.reserve_mem_mib >= mem_mib
 
-    def _adopt_reservation(
+    def _adopt_reservations(
         self, policy: GpuPolicy, job_key: str, yielded: set[int] | frozenset[int]
-    ) -> int | None:
-        """The GPU this pool already holds for ``job_key``, taken over by this thread.
+    ) -> list[int]:
+        """The GPUs this pool already holds for ``job_key``, taken over by this thread.
 
         A job that waits again — on another worker thread of the same pool, after its
         claim came back round — keeps the GPU that was held for it rather than starting
         the wait for one over. The thread is written into the record so the admission
         path knows which waiter the GPU is open to.
         """
+        mine: list[int] = []
         for g in policy.gpus:
             if g in yielded:
                 continue
@@ -2276,8 +2430,8 @@ class GpuManager(GpuInterface):
                 rec["tid"] = threading.get_ident()
                 with contextlib.suppress(OSError):
                     atomic_write_json(self._reserve_file(g), rec)
-            return g
-        return None
+            mine.append(g)
+        return mine
 
     @staticmethod
     def _reservation_to_take_over(
@@ -2320,10 +2474,16 @@ class GpuManager(GpuInterface):
             atomic_write_json(self._reserve_file(g), rec)
 
     def release_reservation(self, job_key: str | None = None) -> int | None:
-        """Give back the GPU this thread holds, if it holds one; returns its index."""
+        """Give back the GPUs this thread holds, if any; returns the first one's index."""
+        given = self.release_reservations(job_key)
+        return given[0] if given else None
+
+    def release_reservations(self, job_key: str | None = None) -> list[int]:
+        """Give back every GPU this thread holds for ``job_key`` (or for any job)."""
         policy = self._policy_or_none()
         if policy is None:
-            return None
+            return []
+        given: list[int] = []
         for g in policy.gpus:
             rec = self._read_reservation(g)
             if rec is None or not self._reservation_is_mine(rec):
@@ -2331,8 +2491,8 @@ class GpuManager(GpuInterface):
             if job_key is not None and rec.get("job") != job_key:
                 continue
             self._clear_reservation(g)
-            return g
-        return None
+            given.append(g)
+        return given
 
     def release_dead_reservations(self, waiting_tids=None) -> list[int]:
         """Give back the GPUs this pool holds for threads that are not waiting any more.
@@ -2454,6 +2614,7 @@ class GpuManager(GpuInterface):
         cap_per_gpu: int | None = None,
         cap_group: str | None = None,
         gpus: tuple[int, ...] | None = None,
+        gpu_count: int = 1,
     ) -> GpuSlot | None:
         """Try to reserve ``slots`` slot-units with ``>= mem_mib`` free, or ``None``.
 
@@ -2475,6 +2636,12 @@ class GpuManager(GpuInterface):
         that tie and in this machine's policy. A job that uses no GPU is unaffected by
         it, since it takes no GPU at all.
 
+        ``gpu_count`` is how many GPUs the job runs on at once, one shard each. Every
+        check above is made on each of them — ``slots`` units, the stage ceiling, the
+        budget and ``mem_mib`` free — and the grant is all-or-nothing: fewer GPUs than
+        that passing means no grant and nothing held. The GPUs are the first to pass
+        in the least-loaded order, so a job spreads over the emptiest GPUs.
+
         ``slots=0`` declares a fully CPU-bound job. It takes a slot from the separate
         ``policy.cpu_cap`` budget in its own lock namespace, never from GPU capacity, and
         returns ``gpu=None``. Two independent budgets, because the two concerns are
@@ -2493,7 +2660,8 @@ class GpuManager(GpuInterface):
         if slots == 0:
             return self._acquire_cpu_slot(policy)
         open_to_it = self._allowed(policy, gpus)
-        if not open_to_it:
+        count = max(1, int(gpu_count))
+        if len(open_to_it) < count:
             return None
         need = max(1, min(slots, policy.slot_units))
         # Opening and flocking the machine-wide lock sits inside the clean-up scope: a failure
@@ -2526,131 +2694,194 @@ class GpuManager(GpuInterface):
                 return None
             self._note_mem_outage(None)
             self._note_free_seen(snapshot)
-            for g in order:
-                if g in yielded:
-                    self._clear_reservation(g)  # a GPU promised away holds nothing
-                    continue
-                reserved = self._read_reservation(g)
-                if (
-                    reserved is not None
-                    and not self._reservation_is_mine(reserved)
-                    and self._reservation_has_a_waiter(reserved)
-                ):
-                    # Held for another waiting job: nothing of ours goes on this GPU
-                    # until that job is admitted or stops waiting.
-                    continue
-                if snapshot.get(g, 0) < mem_mib:
-                    continue
-                if counts[g] + need > policy.slot_units:
-                    # The GPU already holds the cap's worth of units, or more than it
-                    # after a lowered cap, so nothing more goes on it until they end.
-                    continue
-                held: list[tuple[int, int]] = []  # (slot index, fd)
-                group_fd: int | None = None
-                # Any exception below (an nvidia-smi hiccup in _mem_ok, a filesystem error)
-                # must roll the flocked fds back before propagating: a leaked fd is a
-                # slot-unit gone until the pool dies.
-                try:
-                    for s in range(policy.slot_units):
-                        fd = self._try_slot(g, s)
-                        if fd is not None:
-                            held.append((s, fd))
-                            if len(held) == need:
-                                break
-                    if len(held) < need:  # not enough free units -> all-or-nothing rollback
-                        for _, fd in held:
-                            _close_lock(fd)
-                        continue
-                    if cap_per_gpu is not None:
-                        group_fd = self._try_group_slot(
-                            cap_group or "default", g, cap_per_gpu
+            pending = list(order)
+            passed: list[_Taken] = []
+            batch: list[_Taken] = []
+            # Any exception below (an nvidia-smi hiccup in the gate, a filesystem error)
+            # must roll the flocked fds back before propagating, the batch under the
+            # gate as well as the GPUs already passed: a leaked fd is a slot-unit gone
+            # until the pool dies.
+            try:
+                while len(passed) < count:
+                    # Take the units on the next GPUs that pass the cheap checks, up to
+                    # the number still wanted; then put that batch through the memory
+                    # gate together. A GPU the gate turns down is let go and the walk
+                    # carries on to the next one, so a job is never refused while a GPU
+                    # further down the order would take it.
+                    batch = []
+                    while pending and len(passed) + len(batch) < count:
+                        g = pending.pop(0)
+                        if g in yielded:
+                            self._clear_reservation(g)  # a GPU promised away holds nothing
+                            continue
+                        reserved = self._read_reservation(g)
+                        if (
+                            reserved is not None
+                            and not self._reservation_is_mine(reserved)
+                            and self._reservation_has_a_waiter(reserved)
+                        ):
+                            # Held for another waiting job: nothing of ours goes on this
+                            # GPU until that job is admitted or stops waiting.
+                            continue
+                        if snapshot.get(g, 0) < mem_mib:
+                            continue
+                        if counts[g] + need > policy.slot_units:
+                            # The GPU already holds the cap's worth of units, or more
+                            # than it after a lowered cap, so nothing more goes on it
+                            # until they end.
+                            continue
+                        taken = self._take_units(
+                            g, need, mem_mib, cap_per_gpu, cap_group, policy
                         )
-                        if group_fd is None:  # stage ceiling reached on this GPU
-                            for _, fd in held:
-                                _close_lock(fd)
-                            continue
-                    # What this queue folder's own running jobs asked for on this GPU:
-                    # a hard per-GPU budget, plus the start-up hold for the asks whose
-                    # memory may not be visible in the free reading yet.
-                    asks = self._read_asks(g, policy)
-                    committed = sum(self._ask_mib(a) for a in asks)
-                    if (
-                        policy.mem_budget_mib
-                        and committed + mem_mib > policy.mem_budget_mib
-                    ):
-                        for _, fd in held:
-                            _close_lock(fd)
-                        _close_lock(group_fd)
-                        group_fd = None
-                        continue
-                    if self._mem_ok(
-                        g, mem_mib, policy.reserve_mem_mib, policy, asks=asks
-                    ):
-                        # Late yield re-check: the memory gate sleeps (~mem_interval_s) while we
-                        # hold the slot, and the watchdog can yield this GPU during that sleep.
-                        # Re-read the marker fresh here (not the pre-loop snapshot) and, if the GPU
-                        # became yielded, roll back exactly like the other abandon paths
-                        # rather than dispatch onto a GPU we promised to vacate.
-                        if g in yielding.yielded_gpus(self.root, self.hostname):
-                            for _, fd in held:
-                                _close_lock(fd)
-                            _close_lock(group_fd)
-                            continue
-                        # The ask is recorded before the slot is handed out, against the
-                        # free reading this admission was decided on. A crash before this
-                        # point leaves no record and no held slot, since the kernel drops
-                        # the flocks with the process.
-                        free_at_grant = self._last_free.get(g, snapshot.get(g, 0))
-                        granted_ts = float(self.clock())
-                        try:
-                            ask_paths = self._write_ask(
-                                g,
-                                [s for s, _ in held],
+                        if taken is not None:
+                            batch.append(taken)
+                    if len(passed) + len(batch) < count:
+                        self._drop_taken(batch)
+                        self._drop_taken(passed)
+                        return None
+                    ok = self._mem_ok_all(
+                        [c.gpu for c in batch],
+                        mem_mib,
+                        policy.reserve_mem_mib,
+                        policy,
+                        asks={c.gpu: c.asks for c in batch},
+                    )
+                    for c in batch:
+                        if c.gpu in ok:
+                            passed.append(c)
+                        else:
+                            self._drop_taken([c])  # not enough memory -> next GPU
+                # Late yield re-check: the memory gate sleeps (~mem_interval_s) while we
+                # hold the slots, and the watchdog can yield a GPU during that sleep.
+                # Re-read the marker fresh here (not the pre-loop snapshot) and, if a
+                # GPU became yielded, roll back exactly like the other abandon paths
+                # rather than dispatch onto a GPU we promised to vacate.
+                yielded_now = yielding.yielded_gpus(self.root, self.hostname)
+                if any(c.gpu in yielded_now for c in passed):
+                    self._drop_taken(passed)
+                    return None
+                # The asks are recorded before the slots are handed out, against the
+                # free reading this admission was decided on. A crash before this
+                # point leaves no record and no held slot, since the kernel drops
+                # the flocks with the process.
+                granted_ts = float(self.clock())
+                ask_paths: list[str] = []
+                free_at: dict[int, int] = {}
+                try:
+                    for c in passed:
+                        free_at[c.gpu] = int(
+                            self._last_free.get(c.gpu, snapshot.get(c.gpu, 0))
+                        )
+                        ask_paths.extend(
+                            self._write_ask(
+                                c.gpu,
+                                [s for s, _ in c.held],
                                 mem_mib,
-                                free_at_grant,
+                                free_at[c.gpu],
                                 granted_ts=granted_ts,
                             )
-                        except OSError as exc:
-                            # Granting without the record would let the next admission
-                            # ignore this job's memory entirely, so the grant is undone
-                            # and the job waits instead.
-                            logger.warning(
-                                "could not record the memory ask on gpu {} ({}); denying "
-                                "this admission rather than granting it unrecorded",
-                                g,
-                                exc,
-                            )
-                            for _, fd in held:
-                                _close_lock(fd)
-                            _close_lock(group_fd)
-                            return None
-                        with self._reg_lock:
-                            self._live_lock_fds.update(fd for _, fd in held)
-                            if group_fd is not None:
-                                self._live_lock_fds.add(group_fd)
-                        return GpuSlot(
-                            gpu=g,
-                            slot=held[0][0],
-                            _fds=[fd for _, fd in held],
-                            _group_fd=group_fd,
-                            _registry=self._live_lock_fds,
-                            _reg_lock=self._reg_lock,
-                            _ask_paths=ask_paths,
-                            granted_ts=granted_ts,
-                            free_at_grant=int(free_at_grant),
-                            mem_mib=int(mem_mib),
                         )
-                    for _, fd in held:  # not enough memory -> next GPU
-                        _close_lock(fd)
-                    _close_lock(group_fd)
-                except Exception:
-                    for _, fd in held:
-                        _close_lock(fd)
-                    _close_lock(group_fd)
-                    raise
-            return None
+                except OSError as exc:
+                    # Granting without the record would let the next admission ignore
+                    # this job's memory entirely, so the grant is undone and the job
+                    # waits instead.
+                    logger.warning(
+                        "could not record the memory ask on gpu {} ({}); denying "
+                        "this admission rather than granting it unrecorded",
+                        ",".join(str(c.gpu) for c in passed),
+                        exc,
+                    )
+                    for path in ask_paths:
+                        with contextlib.suppress(OSError):
+                            os.unlink(path)
+                    self._drop_taken(passed)
+                    return None
+                with self._reg_lock:
+                    for c in passed:
+                        self._live_lock_fds.update(fd for _, fd in c.held)
+                        if c.group_fd is not None:
+                            self._live_lock_fds.add(c.group_fd)
+                first = passed[0]
+                return GpuSlot(
+                    gpu=first.gpu,
+                    slot=first.held[0][0],
+                    _fds=[fd for c in passed for _, fd in c.held],
+                    _group_fd=first.group_fd,
+                    _group_fds=[c.group_fd for c in passed[1:] if c.group_fd is not None],
+                    gpus=tuple(c.gpu for c in passed),
+                    _registry=self._live_lock_fds,
+                    _reg_lock=self._reg_lock,
+                    _ask_paths=ask_paths,
+                    granted_ts=granted_ts,
+                    free_at_grant=free_at[first.gpu],
+                    mem_mib=int(mem_mib),
+                )
+            except Exception:
+                self._drop_taken(batch)
+                self._drop_taken(passed)
+                raise
         finally:
             _close_lock(acq_fd)
+
+    def _take_units(
+        self,
+        g: int,
+        need: int,
+        mem_mib: int,
+        cap_per_gpu: int | None,
+        cap_group: str | None,
+        policy: GpuPolicy,
+    ) -> _Taken | None:
+        """Take ``need`` slot-units, the stage slot and the budget on GPU ``g``, or nothing.
+
+        All-or-nothing: a GPU with too few free units, a full stage group or a budget
+        the ask would exceed is left exactly as it was found. What is returned still
+        has to pass the memory gate; the caller lets it go if it does not.
+        """
+        held: list[tuple[int, int]] = []  # (slot index, fd)
+        group_fd: int | None = None
+        try:
+            for s in range(policy.slot_units):
+                fd = self._try_slot(g, s)
+                if fd is not None:
+                    held.append((s, fd))
+                    if len(held) == need:
+                        break
+            if len(held) < need:  # not enough free units -> all-or-nothing rollback
+                for _, fd in held:
+                    _close_lock(fd)
+                return None
+            if cap_per_gpu is not None:
+                group_fd = self._try_group_slot(cap_group or "default", g, cap_per_gpu)
+                if group_fd is None:  # stage ceiling reached on this GPU
+                    for _, fd in held:
+                        _close_lock(fd)
+                    return None
+            # What this queue folder's own running jobs asked for on this GPU: a hard
+            # per-GPU budget, plus the start-up hold for the asks whose memory may not
+            # be visible in the free reading yet.
+            asks = self._read_asks(g, policy)
+            committed = sum(self._ask_mib(a) for a in asks)
+            if policy.mem_budget_mib and committed + mem_mib > policy.mem_budget_mib:
+                for _, fd in held:
+                    _close_lock(fd)
+                _close_lock(group_fd)
+                return None
+            return _Taken(gpu=g, held=held, group_fd=group_fd, asks=asks)
+        except Exception:
+            for _, fd in held:
+                _close_lock(fd)
+            _close_lock(group_fd)
+            raise
+
+    @staticmethod
+    def _drop_taken(taken: list[_Taken]) -> None:
+        """Let go of every lock in ``taken``, and empty it."""
+        for c in taken:
+            for _, fd in c.held:
+                _close_lock(fd)
+            _close_lock(c.group_fd)
+        taken.clear()
 
     def reap_leaked_locks(self) -> list[str]:
         """Close slot-lock fds this process holds that no live :class:`GpuSlot` owns.
