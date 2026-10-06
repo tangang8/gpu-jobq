@@ -508,10 +508,7 @@ class Sampler:
                 idle_gpus += 1
                 words.append(f"{g}:idle")
             else:
-                words.append(
-                    f"{g}:busy({_number_text(reading.util_pct)}%,{reading.mem_used_mib}MiB,"
-                    f"{jobs} of ours)"
-                )
+                words.append(f"{g}:busy({_number_text(reading.util_pct)}%,{reading.mem_used_mib}MiB)")
             append_row(
                 path,
                 GPU_COLUMNS,

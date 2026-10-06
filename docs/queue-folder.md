@@ -207,13 +207,12 @@ Beside each CSV file is a log of the same name ending in `.log`, with one line
 per sample saying the same thing in words, for reading with `tail`:
 
 ```text
-gpu.<hostname>.log    2026-10-03T02:41:54+00:00 6/8 idle | 0:idle 1:idle 2:idle 3:idle 4:idle 5:idle 6:busy(75%,30719MiB,1 of ours) 7:busy(97%,30719MiB,1 of ours)
+gpu.<hostname>.log    2026-10-03T02:41:54+00:00 6/8 idle | 0:idle 1:idle 2:idle 3:idle 4:idle 5:idle 6:busy(75%,30719MiB) 7:busy(97%,30719MiB)
 cpu.<hostname>.log    2026-10-03T02:41:54+00:00 busy | util 36.9% (~18/48 cores) load 19.4/20.1/21.7 mem 159002/740466MiB
 slots.<hostname>.log  2026-10-03T02:41:54+00:00 8/40 slots used, 0 waiting | 8 gpus, 0 yielded, cap 5 per gpu | pool live
 ```
 
-A busy GPU's entry gives its utilisation, its memory in use and how many of
-this queue folder's jobs hold a slot on it. The logs are trimmed with the CSV
+A busy GPU's entry gives its utilisation and its memory in use. The logs are trimmed with the CSV
 files, by `monitor_keep_days`. `jobq usage` and `jobq status` read the CSV
 files only.
 
