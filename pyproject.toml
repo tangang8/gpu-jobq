@@ -19,7 +19,11 @@ classifiers = [
 dependencies = ["typer", "loguru"]
 
 [project.optional-dependencies]
-dev = ["pytest", "ruff"]
+dev = [
+    "pytest",
+    "pytest-xdist>=3.8.0",
+    "ruff",
+]
 
 [project.scripts]
 jobq = "jobq.cli:app"

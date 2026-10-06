@@ -598,6 +598,18 @@ class _Pool:
         self._paused_seen: set[str] = set()
         # The queue whose lapsed pause this thread took the probe of in its current pass.
         self._probe_tls = threading.local()
+        # Completion answers memoised for the length of one pass on this thread (see
+        # :meth:`_one_pass`), so a queue is asked once per pass rather than once per
+        # question about it.
+        self._pass_tls = threading.local()
+        # The pass every worker thread reads its ready list from (see
+        # :meth:`shared_ready_queues`): (monotonic time taken, ready list, the queue
+        # whose lapsed-pause probe the scanning thread took). One thread rescans under
+        # ``_scan_lock`` while the others wait for its answer.
+        self._scan_lock = threading.Lock()
+        self._scan: tuple[float, list[tuple[str, QueueMeta]], str | None] | None = None
+        self._scan_complete: bool | None = None
+        self._scan_memo: dict[str, bool] = {}
         # Queues whose unreachable working directory this pool has reported, and the jobs
         # it handed back because their own working directory is unreachable here: those
         # are left to other machines and never claimed again by this pool.
@@ -676,6 +688,31 @@ class _Pool:
         return globals()[_TUNABLE_FALLBACKS[name]]
 
     # ------------------- queue selection -------------------
+
+    @contextlib.contextmanager
+    def _one_pass(self, memo: dict[str, bool] | None = None):
+        """Memoise :func:`store.queue_complete` on this thread until the outermost exit.
+
+        ``memo`` carries the answers of an earlier pass that is still current into this
+        one, and is filled in by it.
+        """
+        if getattr(self._pass_tls, "complete", None) is not None:
+            yield
+            return
+        self._pass_tls.complete = {} if memo is None else memo
+        try:
+            yield
+        finally:
+            self._pass_tls.complete = None
+
+    def _queue_complete(self, name: str) -> bool:
+        """:func:`store.queue_complete`, answered once per queue inside one pass."""
+        memo = getattr(self._pass_tls, "complete", None)
+        if memo is None:
+            return store.queue_complete(self.root, name)
+        if name not in memo:
+            memo[name] = store.queue_complete(self.root, name)
+        return memo[name]
 
     def _node_queues(self) -> list[str]:
         """Queue names this machine may claim from (machine tie + any --queues restriction).
@@ -790,7 +827,7 @@ class _Pool:
 
     def _deps_ok(self, meta: QueueMeta) -> bool:
         for dep in meta.depends_on:
-            if not (store.queue_exists(self.root, dep) and store.queue_complete(self.root, dep)):
+            if not (store.queue_exists(self.root, dep) and self._queue_complete(dep)):
                 # A dep that exists but holds no jobs is never "complete", so this queue
                 # would park forever with nothing to show for it; say so once.
                 if store.queue_exists(self.root, dep) and not store.load_jobs(self.root, dep):
@@ -883,6 +920,10 @@ class _Pool:
         every machine until ``jobq unpark``; the jobs it already has running finish
         normally, since nothing here touches a claim that exists.
         """
+        with self._one_pass():
+            return self._ready_queues()
+
+    def _ready_queues(self) -> list[tuple[str, QueueMeta]]:
         ready: list[tuple[str, QueueMeta]] = []
         self._probe_tls.queue = None
         for name in self._node_queues():
@@ -896,7 +937,7 @@ class _Pool:
                     continue
                 if self._observe_pause(name):
                     continue
-                if store.queue_complete(self.root, name):
+                if self._queue_complete(name):
                     self._maybe_log_complete(name)
                     continue
                 if not self._deps_ok(meta):
@@ -911,6 +952,46 @@ class _Pool:
             ready.append((name, meta))
         ready.sort(key=lambda nm: store.queue_order_key(nm[1]))
         return ready
+
+    def shared_ready_queues(self) -> list[tuple[str, QueueMeta]]:
+        """The ready list every worker thread claims from, rescanned once per ``poll_s``.
+
+        The first thread to find the last pass ``poll_s`` old or older runs
+        :meth:`ready_queues` under a lock; the threads that arrive meanwhile wait for and
+        take its answer, so the folder is scanned once per interval however many threads
+        the pool runs. A queue whose lapsed pause the scanning thread took the probe of is
+        left out of every other thread's list, as their own pass would have read it as
+        still paused.
+        """
+        snap = self._scan
+        if snap is None or time.monotonic() - snap[0] >= self.poll_s:
+            with self._scan_lock:
+                snap = self._scan
+                if snap is None or time.monotonic() - snap[0] >= self.poll_s:
+                    memo: dict[str, bool] = {}
+                    with self._one_pass(memo):
+                        ready = self.ready_queues()
+                    self._scan_memo = memo
+                    snap = (time.monotonic(), ready, getattr(self._probe_tls, "queue", None))
+                    self._scan = snap
+                    self._scan_complete = None
+                    return list(ready)
+        self._probe_tls.queue = None
+        return [nm for nm in snap[1] if nm[0] != snap[2]]
+
+    def shared_all_complete(self) -> bool:
+        """:meth:`all_complete`, asked once per shared pass and confirmed before a yes.
+
+        A pool exits on a yes, so that answer is re-derived fresh before it is given; a no
+        only keeps a thread polling, and the pass's answer serves every thread.
+        """
+        with self._scan_lock:
+            if self._scan_complete is None:
+                with self._one_pass(self._scan_memo):
+                    self._scan_complete = self.all_complete()
+            if not self._scan_complete:
+                return False
+        return self.all_complete()
 
     def _queue_cwd_unreachable(self, meta: QueueMeta) -> str | None:
         """Why the queue's default working directory cannot be used here, or ``None``."""
@@ -962,7 +1043,7 @@ class _Pool:
         out = []
         for name in store.list_queues(self.root):
             try:
-                if store.queue_complete(self.root, name):
+                if self._queue_complete(name):
                     continue
                 out.append((name, store.read_meta(self.root, name)))
             except (store.QueueMetaUnreadable, store.QueuePathUnsafe, PermissionError):
@@ -1028,6 +1109,10 @@ class _Pool:
         still work this pool is here to do. Nor is a queue that waits on one running on
         another machine, which that machine can still finish.
         """
+        with self._one_pass():
+            return self._set_aside_reasons()
+
+    def _set_aside_reasons(self) -> dict[str, str]:
         reason = self._never_completes()
         aside: dict[str, str] = {}
         for name, meta in self._incomplete_metas():
@@ -1060,16 +1145,39 @@ class _Pool:
         The queues :meth:`set_aside` names are ignored for the same reason — nothing this
         pool does can bring them any closer to done.
         """
-        aside = set(self.set_aside())
-        for n in self._node_queues():
-            if n in aside:
-                continue
-            try:
-                if not store.queue_complete(self.root, n):
+        with self._one_pass():
+            aside: set[str] | None = None
+            for n in self._node_queues():
+                try:
+                    if self._queue_complete(n):
+                        continue
+                except PermissionError:
+                    continue
+                if self._surely_not_aside(n):
                     return False
-            except PermissionError:
-                continue
-        return True
+                if aside is None:
+                    aside = set(self.set_aside())
+                if n not in aside:
+                    return False
+            return True
+
+    def _surely_not_aside(self, name: str) -> bool:
+        """Whether an incomplete queue of this machine is certainly not set aside.
+
+        The reasons :meth:`set_aside_reasons` gives that need the whole folder all start
+        from a queue with dependencies or with no jobs; one with neither, not parked and
+        with a reachable working directory, is work this pool is here to do, which is
+        known without walking every other queue.
+        """
+        try:
+            meta = store.read_meta(self.root, name)
+            if meta.parked or meta.depends_on:
+                return False
+            if self._queue_cwd_unreachable(meta) is not None:
+                return False
+            return bool(store.load_jobs(self.root, name))
+        except (store.QueueMetaUnreadable, store.QueuePathUnsafe, OSError, ValueError):
+            return False
 
     def root_complete(self) -> bool:
         """True once every queue in the queue folder is complete, whoever they belong to.
@@ -1080,7 +1188,7 @@ class _Pool:
         """
         for n in store.list_queues(self.root):
             try:
-                if not store.queue_complete(self.root, n):
+                if not self._queue_complete(n):
                     return False
             except PermissionError:
                 continue
@@ -2334,7 +2442,7 @@ class _Pool:
         no matter where an exception escapes; the stranded on-disk claim is then unregistered,
         which is exactly the state the supervisor's janitor collects after its grace.
         """
-        ready = self.ready_queues()
+        ready = self.shared_ready_queues()
         # Recovery of what a dead pool left behind is its own pass (see
         # :meth:`recover_claims`), run at pool start and on every supervisor tick. This
         # one is only an optimisation: a queue this thread is about to claim from is
@@ -2365,7 +2473,7 @@ class _Pool:
             if outcome == "next":  # gave the job back: keep walking the ready list
                 continue
             return outcome  # None (ran) or "exit"
-        if self.all_complete():
+        if self.shared_all_complete():
             return "complete"
         time.sleep(self.poll_s)
         return None

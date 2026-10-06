@@ -52,6 +52,7 @@ import re
 import shutil
 import signal
 import socket
+import stat
 import threading
 import time
 import uuid
@@ -312,6 +313,21 @@ class QueuePathUnsafe(ValueError):
 QUEUE_OWN_DIRS = ("claims", "results", "attempts", "logs")
 
 
+# The verdict on a queue's own directories, keyed by queue directory and paired with that
+# directory's (inode, mtime). Replacing one of the own directories with a link renames or
+# removes an entry of the queue directory, which moves its mtime, so the verdict is reused
+# only while both still match; the queue directory itself is looked at on every call. A
+# change within one timestamp tick of the check leaves the mtime as it was, so a verdict
+# is only kept once the directory's mtime is ``_QUEUE_PATH_SETTLED_NS`` older than this
+# machine's clock.
+# Every path into one of the own directories also looks at that directory on each use
+# (see :func:`_own_dir`), so a link that appears within one mtime tick is still refused
+# there. Bounded by emptying it once it holds ``_QUEUE_PATH_CACHE_MAX`` entries.
+_QUEUE_PATH_CACHE: dict[str, tuple[int, int]] = {}
+_QUEUE_PATH_CACHE_MAX = 65536
+_QUEUE_PATH_SETTLED_NS = 2_000_000_000
+
+
 def queue_path_reason(root: Path, name: str) -> str | None:
     """Why the queue's own directories cannot be used, or ``None`` when they can be.
 
@@ -319,14 +335,40 @@ def queue_path_reason(root: Path, name: str) -> str | None:
     check starts at the queue directory. From there down the names jobq owns must be real
     directories, so that an entry built from a jobkey stays inside the queue folder.
     """
-    qdir = Path(root) / name
-    if qdir.is_symlink():
+    qdir = os.path.join(root, name)
+    try:
+        st = os.lstat(qdir)
+    except OSError:
+        st = None
+    if st is not None and stat.S_ISLNK(st.st_mode):
         return f"{qdir} is a link, and a queue directory must be a directory"
+    stamp = None if st is None else (st.st_ino, st.st_mtime_ns)
+    if stamp is not None and _QUEUE_PATH_CACHE.get(qdir) == stamp:
+        return None
     for sub in QUEUE_OWN_DIRS:
-        p = qdir / sub
-        if p.is_symlink():
+        p = os.path.join(qdir, sub)
+        if os.path.islink(p):
             return f"{p} is a link, and a queue's {sub} must be a directory"
+    if stamp is not None and time.time_ns() - st.st_mtime_ns > _QUEUE_PATH_SETTLED_NS:
+        if len(_QUEUE_PATH_CACHE) >= _QUEUE_PATH_CACHE_MAX:
+            _QUEUE_PATH_CACHE.clear()
+        _QUEUE_PATH_CACHE[qdir] = stamp
     return None
+
+
+def _own_dir(root: Path, name: str, sub: str) -> Path:
+    """One of the queue's own directories, looked at afresh on every call.
+
+    Raises:
+        QueuePathUnsafe: the queue directory or ``sub`` inside it is a link.
+    """
+    p = queue_dir(root, name) / sub
+    if os.path.islink(p):
+        raise QueuePathUnsafe(
+            f"queue {name!r} cannot be used: {p} is a link, and a queue's {sub} must be "
+            "a directory"
+        )
+    return p
 
 
 def queue_dir(root: Path, name: str) -> Path:
@@ -353,7 +395,7 @@ def _jobs_path(root: Path, name: str) -> Path:
 
 
 def _claims_dir(root: Path, name: str) -> Path:
-    return queue_dir(root, name) / "claims"
+    return _own_dir(root, name, "claims")
 
 
 class InvalidJobName(ValueError):
@@ -415,7 +457,7 @@ def _owner_path(root: Path, name: str, jobkey: str) -> Path:
 
 
 def _results_dir(root: Path, name: str) -> Path:
-    return queue_dir(root, name) / "results"
+    return _own_dir(root, name, "results")
 
 
 def _result_path(root: Path, name: str, jobkey: str) -> Path:
@@ -424,12 +466,12 @@ def _result_path(root: Path, name: str, jobkey: str) -> Path:
 
 def _attempt_path(root: Path, name: str, jobkey: str) -> Path:
     return _child_of(
-        queue_dir(root, name) / "attempts", f"{check_job_file_name(jobkey)}.json"
+        _own_dir(root, name, "attempts"), f"{check_job_file_name(jobkey)}.json"
     )
 
 
 def queue_logs_dir(root: Path, name: str) -> Path:
-    return queue_dir(root, name) / "logs"
+    return _own_dir(root, name, "logs")
 
 
 # --------------------------- meta / queues ---------------------------
@@ -2274,7 +2316,7 @@ def read_mem_floors(
 
     Read-only, so a caller can say what it is about to clear before clearing it.
     """
-    adir = queue_dir(root, name) / "attempts"
+    adir = _own_dir(root, name, "attempts")
     if not adir.is_dir():
         return []
     if jobkeys is None:

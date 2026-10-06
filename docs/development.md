@@ -12,6 +12,14 @@ uv sync --extra dev
 uv run ruff check .
 ```
 
+The test suite runs serially or across processes with `pytest-xdist`; each
+test works in its own temporary folder, so both give the same result:
+
+```bash
+uv run pytest -q
+uv run pytest -q -n auto
+```
+
 Run commands with `uv run` or activate `.venv`. Without uv, use a virtual
 environment and pip:
 
