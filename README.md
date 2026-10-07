@@ -237,6 +237,8 @@ already running on that GPU:
 | `drain` | Left to finish |
 | `drain_if_near_done` | Nearly finished jobs are left to finish; the rest are stopped and returned to the queue |
 
+A pool whose usable GPUs are all yielded claims no GPU job meanwhile, and hands
+back any it was waiting to start, so another machine can run them.
 A job stopped for a yield is not counted as failed. jobq uses the GPU again
 after it has seen no other user's process there for `yield_cooldown_s`, which
 defaults to 15 minutes. Most policy edits take effect while a pool is running;

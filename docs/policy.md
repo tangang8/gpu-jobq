@@ -168,6 +168,13 @@ Actions apply to this pool's jobs on the yielded GPU:
 - `drain_if_near_done`: spare jobs whose estimated progress meets the threshold;
   terminate and requeue the others.
 
+While a GPU is yielded the pool claims no job it would have to wait for that
+GPU to run: a claim held here while every GPU a job could use is yielded would
+keep every other machine from the job for as long as the other user stays. A
+job already waiting when its last usable GPU is yielded is handed back to the
+queue, not counted as an attempt, and the pool claims again once a GPU of its
+own is reclaimed. Jobs that take no GPU are unaffected.
+
 Progress comes from the last usable regex match in the log, then elapsed time
 relative to the median duration of at least five successful jobs in the queue.
 If neither estimate is available, progress is zero. For output such as

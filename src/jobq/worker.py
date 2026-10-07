@@ -769,7 +769,9 @@ class _Pool:
         A queue whose tie names GPUs this machine's policy does not select can never run
         here, so it is left alone rather than claimed and parked on. A GPU that is
         merely yielded is a wait, not a refusal, so it still counts as one this machine
-        could work on.
+        could work on: the pool stays for the queue. Whether a job of it is claimed
+        while the GPU is yielded is decided per job (see :meth:`_claimable_job`), and
+        the answer there is no.
 
         The GPUs of a tie say nothing about a job that takes no GPU, so a queue holding
         such a job is claimable here for it whatever its GPU list names. Each job's own
@@ -796,13 +798,15 @@ class _Pool:
         with self._lock:
             skipped = {k for q, k in self._cwd_skipped if q == name}
         allowed = self._tie_gpus(meta)
-        room = self._gpu_room(meta)
+        room = self._gpu_room(meta, now=True)
         default = int(meta.defaults.get("slots", 1))
         default_count = max(1, int(meta.defaults.get("gpu_count", 1)))
 
         def fits_here(job) -> bool:
-            # A job that runs on more GPUs than this machine can offer the queue is left
-            # to a machine that has them, rather than claimed and waited on for ever.
+            # A job that runs on more GPUs than this machine can offer the queue right
+            # now is left to a machine that has them, rather than claimed and waited on:
+            # a claim held here while every GPU is yielded to another user keeps every
+            # other machine from the job for as long as that user stays.
             if (default if job.slots is None else job.slots) == 0:
                 return True
             count = default_count if job.gpu_count is None else max(1, job.gpu_count)
@@ -817,18 +821,25 @@ class _Pool:
             (default if job.slots is None else job.slots) == 0 and job.jobkey not in skipped
         )
 
-    def _gpu_room(self, meta: QueueMeta) -> int | None:
+    def _gpu_room(self, meta: QueueMeta, *, now: bool = False) -> int | None:
         """How many GPUs of this machine a queue may be placed on; ``None`` when unknown.
 
         The GPUs both the tie and this machine's policy name, or every policy GPU when
-        the queue names none. A machine without a readable policy answers ``None``: it
-        has nothing to compare a job's GPU count against.
+        the queue names none. With ``now``, less the GPUs yielded to another user: what
+        a job could be dispatched to at this moment rather than ever. A machine without
+        a readable policy answers ``None``: it has nothing to compare a job's GPU count
+        against.
         """
         allowed = self._tie_gpus(meta)
-        if allowed is not None:
-            return len(allowed)
-        policy_gpus = self.gpu.policy_gpus()
-        return None if policy_gpus is None else len(policy_gpus)
+        if allowed is None:
+            policy_gpus = self.gpu.policy_gpus()
+            if policy_gpus is None:
+                return None
+            allowed = tuple(policy_gpus)
+        if now:
+            yielded = yielding.yielded_gpus(self.root, self.hostname)
+            allowed = tuple(g for g in allowed if g not in yielded)
+        return len(allowed)
 
     def _has_cpu_only_job(self, meta: QueueMeta) -> bool:
         """Whether any job of a queue takes no GPU, by its own field or the queue default.
@@ -1515,11 +1526,24 @@ class _Pool:
             return "its queue is not tied to this machine any more"
         if slots > 0 and self._tie_gpus(meta) != tie:
             return "its queue does not allow the GPUs this job was going to use"
-        room = self._gpu_room(meta) if slots > 0 else None
+        if slots == 0:
+            return None
+        room = self._gpu_room(meta)
         if room is not None and gpu_count > room:
             return (
                 f"it runs on {gpu_count} GPUs and this machine can offer its queue "
                 f"only {room}"
+            )
+        usable = self._gpu_room(meta, now=True)
+        if usable is not None and gpu_count > usable:
+            # Waiting here would hold the job for as long as the other user stays, and
+            # another machine may have a GPU for it now. This pool claims it again
+            # once a GPU of its own is reclaimed.
+            return (
+                "every GPU it could use on this machine is yielded to another user"
+                if usable == 0
+                else f"only {usable} GPU(s) it could use here are not yielded to another "
+                f"user, and it runs on {gpu_count}"
             )
         return None
 
