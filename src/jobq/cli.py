@@ -1726,15 +1726,31 @@ def stop(
 
 
 def _running_here(root: Path, host: str) -> int:
-    """How many jobs this machine holds a claim on right now."""
+    """How many jobs this machine holds a claim on right now.
+
+    Read from the claim records alone, one ``owner.json`` per claim, rather than from
+    each queue's full status: a queue folder can hold thousands of queues on a network
+    filesystem, and the question only needs the claims.
+    """
     n = 0
-    for name in store.list_queues(root):
+    for owner_file in Path(root).glob("*/claims/*/owner.json"):
         try:
-            jobs = store.queue_status(root, name)["running_jobs"]
-        except (OSError, store.QueueMetaUnreadable, store.QueuePathUnsafe):
+            owner = json.loads(owner_file.read_text())
+        except (OSError, ValueError):
             continue
-        n += sum(1 for j in jobs if j.get("node") == host)
+        if isinstance(owner, dict) and owner.get("node") == host:
+            n += 1
     return n
+
+
+def _write_stop_now(root: Path, stop_file: Path, now_file: Path) -> None:
+    """Write the stop file and the request to end the running jobs, or exit naming why."""
+    try:
+        store.ensure_dir(stop_file.parent)
+        stop_file.touch(mode=jobq_io.lock_file_mode())
+        now_file.touch(mode=jobq_io.lock_file_mode())
+    except OSError as exc:
+        raise fail("could not write into the queue folder {}: {}", root, exc) from exc
 
 
 def _stop_now(root: Path, host: str, stop_file: Path, now_file: Path, *, yes: bool) -> None:
@@ -1744,6 +1760,11 @@ def _stop_now(root: Path, host: str, stop_file: Path, now_file: Path, *, yes: bo
     request left in the queue folder would end the jobs of the next pool to start. The
     stop file is written alongside the request, so a pool that reads only the stop file
     still finishes and leaves.
+
+    With ``--yes`` nothing has to be asked, so the request is written before anything
+    else is read: the pool ends the jobs and hands their claims back itself, and a
+    count of them would only delay the stop on a large queue folder. Without it, the
+    question names how many jobs it ends, counted from the claim records.
     """
     if not store.pool_state(root, host)["alive"]:
         logger.info(
@@ -1752,28 +1773,29 @@ def _stop_now(root: Path, host: str, stop_file: Path, now_file: Path, *, yes: bo
             host,
         )
         return
+    if yes:
+        _write_stop_now(root, stop_file, now_file)
+        logger.info(
+            "Asked the pool on {} to end its running jobs and put them back in the queue",
+            host,
+        )
+        return
     n = _running_here(root, host)
     word = "job" if n == 1 else "jobs"
-    if not yes:
-        question = (
-            f"this ends {n} running {word} on {host}; "
-            + ("it starts" if n == 1 else "they start")
-            + " again from the beginning. Continue?"
+    question = (
+        f"this ends {n} running {word} on {host}; "
+        + ("it starts" if n == 1 else "they start")
+        + " again from the beginning. Continue?"
+    )
+    if not sys.stdin.isatty():
+        raise fail(
+            "{} needs --yes when it is not run from a terminal; nothing was changed",
+            question,
         )
-        if not sys.stdin.isatty():
-            raise fail(
-                "{} needs --yes when it is not run from a terminal; nothing was changed",
-                question,
-            )
-        if not typer.confirm(question):
-            logger.info("Nothing was changed")
-            return
-    try:
-        store.ensure_dir(stop_file.parent)
-        stop_file.touch(mode=jobq_io.lock_file_mode())
-        now_file.touch(mode=jobq_io.lock_file_mode())
-    except OSError as exc:
-        raise fail("could not write into the queue folder {}: {}", root, exc) from exc
+    if not typer.confirm(question):
+        logger.info("Nothing was changed")
+        return
+    _write_stop_now(root, stop_file, now_file)
     logger.info(
         "Asked the pool on {} to end its {} running {} and put them back in the queue",
         host, n, word,
